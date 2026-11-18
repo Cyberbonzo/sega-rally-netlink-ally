@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import tempfile
 import sys
@@ -102,12 +103,19 @@ def main():
         inputs = ("360:START,372:,600:START,612:,1250:A,1262:,1460:A,1472:,1670:A,1682:,"
                   "1850:A,1862:,2050:START,2062:,2400:A,2412:,2600:X,2612:B,3300:B+RIGHT,3320:B")
         env = dict(os.environ, SR_NETLINK_RACE_BOOT="1", SR_NETLINK_WIDE="1")
+        env.setdefault("SR_NETLINK_HD", "1080")
         cmd = [binary, "--headless", "--interp", "--cue", cue, "--out", output, "--save", "-",
                "--vblanks", "4000", "--shot", "2800,4000", "--input", inputs]
         with (output / "run.log").open("w") as log:
             run(*cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
         if "after 4000 VBlanks" not in (output / "run.log").read_text():
             raise RuntimeError(f"The race ended early. See {output / 'run.log'}")
+        if env["SR_NETLINK_HD"] == "1080":
+            for field in (2800, 4000):
+                with (output / f"shot-{field}.png").open("rb") as shot:
+                    shot.seek(16)  # width and height in the PNG IHDR
+                    if struct.unpack(">II", shot.read(8)) != (1920, 1080):
+                        raise RuntimeError(f"Expected a 1080p race frame at video field {field}")
         print(f"Race test completed. Captures and log in {output}")
     if not args.headless:
         install = work / "game"

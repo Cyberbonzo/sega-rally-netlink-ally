@@ -9,5 +9,6 @@ else
     IFS= read -r cue < cue.path
 fi
 export SR_NETLINK_RACE_BOOT=1 SR_NETLINK_WIDE=1
+export SR_NETLINK_HD="${SR_NETLINK_HD:-1080}"
 mkdir -p saves logs
 exec ./sega-rally-netlink --cue "$cue" --fullscreen --interp --settings "$PWD/controls.ini" --out "$PWD/logs" --save "$PWD/saves/cabinet.bup" "$@" > logs/game.log 2>&1

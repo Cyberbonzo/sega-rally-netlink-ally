@@ -76,9 +76,7 @@ def widen_projection_clip(output):
         const uint32_t bounds_address = c.r[14] + 24;
         const uint32_t bounds = ld32(bounds_address);
         if (bounds == 0x00B00070u || bounds == 0x00EB0070u) {
-            // The game's BGON shadow identifies the active driving layers.
-            const bool racing = (ld16(0x060AA8E6u) & 0x1Fu) == 0x1Cu;
-            const uint32_t wanted = racing ? 0x00EB0070u : 0x00B00070u;
+            const uint32_t wanted = ::rally_course_scene() ? 0x00EB0070u : 0x00B00070u;
             if (bounds != wanted) st32(bounds_address, wanted);
         }
     }
@@ -89,9 +87,20 @@ def widen_projection_clip(output):
         if needle not in source:
             continue
         found += source.count(needle)
-        if local not in source:
-            source = "#include <cstdlib>\n" + source.replace(needle, local + needle)
-            path.write_text(source, encoding="utf-8")
+        if local in source:
+            continue
+        end = source.index(needle)
+        label = "L_0601F7D8:\n"
+        start = source.rindex(label, 0, end) + len(label)
+        existing = source[start:end].strip()
+        if existing and not existing.startswith("static const bool wide_race_enabled ="):
+            raise ValueError("Unexpected code at the graphics context bind")
+        source = source[:start] + local + source[end:]
+        if "#include <cstdlib>" not in source:
+            source = "#include <cstdlib>\n" + source
+        if "extern bool rally_course_scene();" not in source:
+            source = "extern bool rally_course_scene();\n" + source
+        path.write_text(source, encoding="utf-8")
     if found != 1:
         raise ValueError("Expected one graphics context bind in the US NetLink program")
 
@@ -121,7 +130,52 @@ def extend_stage_clock(output):
         raise ValueError("Missing timed-stage initializer in the US NetLink program")
 
 
+def resume_time_attack_result(output):
+    # The second Time Attack finish state leaves its return address on the guest
+    # stack. On SH-2 this runs the HUD epilogue twice before reaching its caller.
+    # Resume it in that caller, retaining both passes and their original effects.
+    guard = "if (c.pc != 0x060167FAu) return; }  // 060167F6 "
+    paths = [p for p in output.glob("p_rally_*.cpp") if guard in p.read_text(encoding="utf-8")]
+    if len(paths) != 1:
+        raise ValueError("Missing Time Attack result dispatcher")
+    p = paths[0]
+    text = p.read_text(encoding="utf-8")
+    p.write_text(replace_one(text, guard, "if (c.pc == 0x06017B3Eu) f_06017B3E(c); " + guard),
+                 encoding="utf-8")
+
+
+def watch_native_save_load(output):
+    entry = "void f_060391B6(SH2Context& c) {"
+    finish = "    { const uint32_t x = c.pr; c.pc = x; return; }  // 060391F2 rts ; nop"
+    candidates = [path for path in output.glob("p_rally_*.cpp") if entry in path.read_text(encoding="utf-8")]
+    if len(candidates) != 1:
+        raise ValueError("Missing unique cabinet progress loader")
+    path = candidates[0]
+    text = path.read_text(encoding="utf-8")
+    if "::rally_progress_load_begin();" not in text:
+        text = replace_one(text, entry, entry + "\n    ::rally_progress_load_begin();")
+        text = replace_one(text, finish, "    ::rally_progress_load_end();\n" + finish)
+        declarations = "void rally_progress_load_begin();\nvoid rally_progress_load_end();\n"
+        path.write_text(declarations + text, encoding="utf-8")
+    # Commit edits as the garage slider writes its working value. Menu item 6
+    # is the explicit SAVE slot picker and must retain the original behaviour.
+    store = "    st8(c.r[1], c.r[3]);  // 060308F2 mov.b r3,@r1"
+    edits = [path for path in output.glob("p_rally_*.cpp") if store in path.read_text(encoding="utf-8")]
+    if len(edits) != 1:
+        raise ValueError("Missing unique car setup edit")
+    path = edits[0]
+    text = path.read_text(encoding="utf-8")
+    if "::rally_garage_edited();" in text:
+        return
+    edit = """    const bool garage_changed = c.r[1] >= 0x060A88F3u && c.r[1] <= 0x060A88F8u
+                             && ld8(c.r[1]) != uint8_t(c.r[3]);
+""" + store + "\n    if (garage_changed) ::rally_garage_edited();"
+    path.write_text("void rally_garage_edited();\n" + replace_one(text, store, edit), encoding="utf-8")
+
+
 def adapt_generated_sources(output):
+    resume_time_attack_result(output)
+    watch_native_save_load(output)
     widen_projection_clip(output)
     extend_stage_clock(output)
     select_metric_units(output)

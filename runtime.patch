@@ -41,15 +41,23 @@ index f6f1f3d..f6b661b 100644
      int ph = sh * f.h / tv_lines;
      g_dst = {(float)((ww - sw) / 2), (float)((wh - ph) / 2), (float)sw, (float)ph};
 diff --git a/runtime/src/machine/bios.cpp b/runtime/src/machine/bios.cpp
-index 3c33c80..bdc86d7 100644
+index 3c33c80..dd66363 100644
 --- a/runtime/src/machine/bios.cpp
 +++ b/runtime/src/machine/bios.cpp
-@@ -1,3 +1,4 @@
-+#include <cstdlib>
- // saturn-recomp runtime — the BIOS, high level: the boot and the services.
- //
- // The boot does what the BIOS does before it jumps to a game: IP.BIN to
-@@ -68,6 +69,11 @@ void bios_boot() {
+@@ -25,6 +25,12 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#include <fcntl.h>
++#endif
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -68,6 +74,11 @@ void bios_boot() {
      }
      if (std::memcmp(ip, "SEGA SEGASATURN ", 16)) sat_fatal("IP.BIN: not a Saturn disc");
      auto be = [&](int o) { return (uint32_t)ip[o] << 24 | ip[o + 1] << 16 | ip[o + 2] << 8 | ip[o + 3]; };
@@ -61,7 +69,7 @@ index 3c33c80..bdc86d7 100644
      uint32_t ip_size = be(0xE0), mstack = be(0xE8), sstack = be(0xEC);
      g_first_read = be(0xF0);
      std::string areas(reinterpret_cast<const char*>(ip + 0x40), 10);   // area symbols: J T U B K A E L
-@@ -79,7 +85,8 @@ void bios_boot() {
+@@ -79,7 +90,8 @@ void bios_boot() {
      // A program's file system reads 0x06000CCC for a directory a previous program left there.
      sh2_mem_write(0x06000C00u, ip, 0x100);
  
@@ -71,6 +79,188 @@ index 3c33c80..bdc86d7 100644
      uint32_t size = 0;
      if (first.empty() || !load_file(first.c_str(), g_first_read, &size))
          sat_fatal("cannot load the 1st read file");
+@@ -285,6 +297,7 @@ static const uint32_t kBupSize = 32768, kBupBlock = 64;
+ struct BupFile { std::string comment; uint8_t language; uint32_t date; std::vector<uint8_t> data; };
+ static std::map<std::string, BupFile> g_bup;
+ static bool g_bup_loaded;
++static bool g_primary_valid;
+ static bool g_bup_changed;                           // since the file was last written
+ static std::string g_bup_path;                       // empty: the saves last for the run alone
+ 
+@@ -321,7 +334,7 @@ static std::string default_save() {
+ 
+ void bios_select_save(const uint8_t* ip) {
+     g_bup.clear();
+-    g_bup_loaded = g_bup_changed = false;
++    g_primary_valid = g_bup_loaded = g_bup_changed = false;
+     g_disc = {ip_field(ip, 0x20, 10), ip_field(ip, 0x2A, 6)};
+     g_bup_path = g_cfg.save == "-" ? "" : !g_cfg.save.empty() ? g_cfg.save : default_save();
+     if (g_bup_path.empty()) sat_note("backup memory: kept for this run alone");
+@@ -341,34 +354,63 @@ static std::string gstr(uint32_t a, int max) {
+     return s;
+ }
+ 
++static bool valid_rally_record(const std::vector<uint8_t>& data) {
++    if (data.size() != 5056) return false;
++    uint32_t sum = 9;
++    for (size_t pos = 0; pos < data.size(); pos += 4) {
++        uint32_t word = uint32_t(data[pos]) << 24 | uint32_t(data[pos + 1]) << 16 |
++                        uint32_t(data[pos + 2]) << 8 | data[pos + 3];
++        if (pos == data.size() - 4) return sum == word;
++        sum += word;
++    }
++    return false;
++}
++
++static bool read_card(const std::string& path, decltype(g_bup)& card) {
++    FILE* f = std::fopen(path.c_str(), "rb");
++    if (!f) return false;
++    bool ok = false;
++    char name[12], comment[11];
++    uint8_t lang;
++    uint32_t date, size;
++    for (;;) {
++        size_t count = std::fread(name, 1, sizeof(name), f);
++        if (!count) { ok = !std::ferror(f); break; }
++        if (count != sizeof(name) || !name[0] || std::fread(comment, 1, sizeof(comment), f) != sizeof(comment) ||
++            std::fread(&lang, 1, 1, f) != 1 || std::fread(&date, 4, 1, f) != 1 ||
++            std::fread(&size, 4, 1, f) != 1 || size > kBupSize) break;
++        BupFile entry{std::string(comment, strnlen(comment, 11)), lang, date, std::vector<uint8_t>(size)};
++        if (size && std::fread(entry.data.data(), 1, size, f) != size) break;
++        std::string key(name, strnlen(name, 12));
++        if (key == "RALLYPLUS_0" && !valid_rally_record(entry.data)) break;
++        card[key] = std::move(entry);
++    }
++    std::fclose(f);
++    return ok;
++}
++
+ static void bup_load() {
+     if (g_bup_loaded) return;
+     g_bup_loaded = true;
+     if (g_bup_path.empty()) return;
+-    FILE* f = std::fopen(g_bup_path.c_str(), "rb");
+-    if (!f) return;
+-    char name[12], comment[11];
+-    uint8_t lang;
+-    uint32_t date, size;
+-    while (std::fread(name, 1, 12, f) == 12 && std::fread(comment, 1, 11, f) == 11 &&
+-           std::fread(&lang, 1, 1, f) == 1 && std::fread(&date, 4, 1, f) == 1 && std::fread(&size, 4, 1, f) == 1) {
+-        BupFile b{std::string(comment, strnlen(comment, 11)), lang, date, std::vector<uint8_t>(size)};
+-        if (size > kBupSize || (size && std::fread(b.data.data(), 1, size, f) != size)) {
+-            sat_note("backup memory: %s is damaged after %zu saves; the rest are left out", g_bup_path.c_str(), g_bup.size());
+-            break;
++    g_primary_valid = read_card(g_bup_path, g_bup);
++    if (!g_primary_valid) {
++        decltype(g_bup) previous;
++        if (read_card(g_bup_path + ".bak", previous)) {
++            g_bup.swap(previous);
++            g_bup_changed = true;
++            sat_note("backup memory: recovered previous card from %s.bak", g_bup_path.c_str());
+         }
+-        g_bup[std::string(name, strnlen(name, 12))] = b;
+     }
+-    std::fclose(f);
+ }
+ 
+-// Written beside the file and renamed over it, so a run that ends partway through leaves the last whole one.
++// Publish complete, synced cards. Keep the previous valid card until the next write succeeds.
+ void bios_save() {
+     if (!g_bup_changed || g_bup_path.empty()) return;
+-    g_bup_changed = false;
+     namespace fs = std::filesystem;
+     std::error_code ec;
+-    if (fs::path(g_bup_path).has_parent_path()) fs::create_directories(fs::path(g_bup_path).parent_path(), ec);
++    fs::path dir = fs::path(g_bup_path).parent_path();
++    if (!dir.empty()) fs::create_directories(dir, ec);
+     std::string tmp = g_bup_path + ".new";
+     FILE* f = std::fopen(tmp.c_str(), "wb");
+     if (!f) { sat_note("backup memory: cannot write %s", tmp.c_str()); return; }
+@@ -381,10 +423,41 @@ void bios_save() {
+         std::fwrite(&b.date, 4, 1, f); std::fwrite(&size, 4, 1, f);
+         std::fwrite(b.data.data(), 1, size, f);
+     }
+-    bool ok = !std::ferror(f);
++    bool ok = !std::ferror(f) && std::fflush(f) == 0;
++#ifdef _WIN32
++    if (ok) ok = _commit(_fileno(f)) == 0;
++#else
++    if (ok) ok = fsync(fileno(f)) == 0;
++#endif
+     ok = std::fclose(f) == 0 && ok;
+-    if (ok) fs::rename(tmp, g_bup_path, ec);
+-    if (!ok || ec) sat_note("backup memory: cannot write %s", g_bup_path.c_str());
++    if (ok && g_primary_valid) {
++        std::string bak = g_bup_path + ".bak";
++        fs::copy_file(g_bup_path, bak + ".new", fs::copy_options::overwrite_existing, ec);
++        if (!ec) fs::rename(bak + ".new", bak, ec);
++    }
++    if (ok && !ec) fs::rename(tmp, g_bup_path, ec);
++    if (!ok || ec) { sat_note("backup memory: cannot replace %s", g_bup_path.c_str()); return; }
++    g_primary_valid = true;
++#ifndef _WIN32
++    int fd = open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY);
++    if (fd < 0) return;
++    int synced = fsync(fd);
++    close(fd);
++    if (synced != 0) return;
++#endif
++    g_bup_changed = false;
++}
++
++bool bios_store_rally_progress(const uint8_t* data, size_t size) {
++    bup_load();
++    auto it = g_bup.find("RALLYPLUS_0");
++    if (it == g_bup.end() || size != 5056 || it->second.data.size() != size) return false;
++    if (std::memcmp(it->second.data.data(), data, size) != 0) {
++        std::memcpy(it->second.data.data(), data, size);
++        g_bup_changed = true;
++    }
++    bios_save();
++    return g_bup_path.empty() || !g_bup_changed;
+ }
+ 
+ static uint32_t days_in(uint32_t y, uint32_t m) {
+@@ -439,25 +512,34 @@ static bool bup_call(SH2Context& c, uint32_t k) {
+         BupFile b{gstr(r5 + 12, 10), (uint8_t)ld8(r5 + 23), ld32(r5 + 24), {}};
+         uint32_t size = ld32(r5 + 28);
+         if (g_bup.count(name) && r7 != 0) { c.r[0] = 6; return true; }   // exists, and r7 asks to keep it
++        if (size > kBupSize) { c.r[0] = 4; return true; }
+         b.data.resize(size);
+         for (uint32_t i = 0; i < size; ++i) b.data[i] = (uint8_t)ld8(r6 + i);
+-        g_bup[name] = b;
+-        sat_note("BUP: wrote %s (%u bytes)", name.c_str(), size);
+-        g_bup_changed = true;
++        auto current = g_bup.find(name);
++        // The game rewrites its profile with a new timestamp even on an idle boot.
++        // Keep the previous distinct progress revision available for recovery.
++        if (name == "RALLYPLUS_0" && !valid_rally_record(b.data)) { c.r[0] = 7; return true; }
++        if (name != "RALLYPLUS_0" || current == g_bup.end() || current->second.data != b.data ||
++            current->second.comment != b.comment || current->second.language != b.language) {
++            g_bup[name] = std::move(b);
++            sat_note("BUP: wrote %s (%u bytes)", name.c_str(), size);
++            g_bup_changed = true;
++        }
+         bios_save();
+-        c.r[0] = 0;
++        c.r[0] = !g_bup_path.empty() && g_bup_changed ? 8 : 0;
+         return true;
+     }
+     case 5: {                                   // Read(device, name, data*)
+         auto it = g_bup.find(gstr(r5, 11));
+         if (r4 != 0 || it == g_bup.end()) { c.r[0] = 5; return true; }
++        sat_note("BUP: read %s (%zu bytes)", it->first.c_str(), it->second.data.size());
+         for (size_t i = 0; i < it->second.data.size(); ++i) st8(r6 + (uint32_t)i, it->second.data[i]);
+         c.r[0] = 0;
+         return true;
+     }
+     case 6: {                                   // Delete(device, name)
+         c.r[0] = g_bup.erase(gstr(r5, 11)) ? 0 : 5;
+-        g_bup_changed = c.r[0] == 0;
++        if (c.r[0] == 0) g_bup_changed = true;
+         bios_save();
+         return true;
+     }
 diff --git a/runtime/src/machine/cdblock.cpp b/runtime/src/machine/cdblock.cpp
 index d5a3049..c3a8d42 100644
 --- a/runtime/src/machine/cdblock.cpp
@@ -102,6 +292,130 @@ index d5a3049..c3a8d42 100644
  }
  
  // Mednafen's file-system read: when `find_root`, a seek to the volume descriptor at FAD 166 and that
+diff --git a/runtime/src/machine/machine.cpp b/runtime/src/machine/machine.cpp
+index 3a20725..32a259c 100644
+--- a/runtime/src/machine/machine.cpp
++++ b/runtime/src/machine/machine.cpp
+@@ -37,6 +37,7 @@
+ #include "host.h"
+ #include "video.h"
+ #include "state.h"
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+@@ -519,6 +520,95 @@ static void checkpoint_due() {
+ }
+ 
+ // ---- time, devices, interrupts ----------------------------------------------------------
++// RALLYPLUS_0 is the NetLink edition's cabinet progress. The game reuses the
++// original BIOS transfer buffer while driving. Encode directly from the same
++// committed records, car setups and options as its own save routine.
++using RallyProgress = std::array<uint8_t, 0x13C0>;
++static RallyProgress rally_progress_image() {
++    RallyProgress image{};
++    size_t out = 0;
++    auto copy = [&](size_t address, size_t count) {
++        std::copy_n(g_wram_h + address, count, image.begin() + out);
++        out += count;
++    };
++    auto word = [](const uint8_t* p) -> uint32_t {
++        return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++    };
++    for (size_t i = 0; i < 384; ++i) {
++        const uint8_t* record = g_wram_h + 0xC3220 + 8 * i;
++        uint32_t attributes = word(record + 4);
++        uint32_t time = word(record) + ((attributes & 0x70000000u) >> 7);
++        uint32_t colour = ((attributes & 0x01000000u) >> 9) + ((attributes & 0xFF0000u) >> 6)
++                        + ((attributes & 0xFF00u) >> 3) + (attributes & 0xFFu);
++        image[out++] = uint8_t(time >> 16);
++        image[out++] = uint8_t(time >> 8);
++        image[out++] = uint8_t(time);
++        image[out++] = uint8_t(colour >> 8);
++        image[out++] = uint8_t(colour);
++    }
++    copy(0xC3E20, 0xC08);
++    image[out++] = g_wram_h[0xC2062] & 0x16;
++    copy(0xC2063, 33);
++    copy(0xC4A38, 17);
++    image[out++] = uint8_t(g_wram_h[0xC4A4C] << 4 | (g_wram_h[0xC4A4D] & 15));
++    uint32_t checksum = 9;
++    for (size_t i = 0; i < out; i += 4) checksum += word(&image[i]);
++    for (int shift = 24; shift >= 0; shift -= 8) image[out++] = uint8_t(checksum >> shift);
++    return image;
++}
++
++static bool rally_loaded;
++static RallyProgress rally_committed, rally_observed;
++static uint64_t rally_next_sample;
++
++// Called by the disc-specific generated code around its initial BUP decode.
++// A restart must not overwrite an existing file with partially initialized RAM.
++void rally_progress_load_begin() { rally_loaded = false; }
++void rally_progress_load_end() {
++    rally_committed = rally_observed = rally_progress_image();
++    rally_next_sample = sat_vblanks() + 15;
++    rally_loaded = true;
++}
++
++// Garage sliders update a temporary copy. Commit the same seven fields as the
++// game's SAVE command when the player changes one. Keep its chosen document
++// slot, so using SAVE explicitly afterwards defaults to the same car.
++void rally_garage_edited() {
++    if (!rally_loaded) return;
++    unsigned choice = g_wram_h[0xA88F2];     // 0 NEW CAR, 1..4 cars A..D
++    uint8_t& occupied = g_wram_h[0xC2063];
++    if (choice == 0) {
++        unsigned slots = 0;
++        while (slots < 4 && (occupied & (1u << slots))) ++slots;
++        if (slots == 4 || occupied != (1u << slots) - 1) return;
++        choice = slots + 1;
++        occupied = uint8_t((1u << choice) - 1);
++        g_wram_h[0xC202A] = uint8_t(choice);  // refresh the garage's count
++        g_wram_h[0xC202B] = 1;
++        g_wram_h[0xA88F2] = uint8_t(choice);
++        g_wram_h[0xA88F9] = uint8_t(slots);  // default target of manual SAVE
++    }
++    if (choice > 4 || !(occupied & (1u << (choice - 1)))) return;
++    uint8_t* setup = g_wram_h + 0xC2064 + (choice - 1) * 8;
++    setup[5] = g_wram_h[0xA88F3];          // transmission
++    std::copy_n(g_wram_h + 0xA88F4, 4, setup + 1);  // handling, tires, suspension
++    setup[7] = g_wram_h[0xA88F8];          // blow-off valve
++    setup[6] = g_wram_h[0xAA80A];          // vehicle
++}
++
++static void rally_progress_poll(bool exiting = false) {
++    if (!rally_loaded) return;
++    const uint64_t frame = sat_vblanks();
++    if (!exiting && frame < rally_next_sample) return;
++    rally_next_sample = frame + 15;
++    const auto image = rally_progress_image();
++    const bool stable = image == rally_observed;
++    rally_observed = image;
++    if (image == rally_committed || (!exiting && !stable)) return;
++    if (bios_store_rally_progress(image.data(), image.size())) rally_committed = image;
++    else rally_next_sample = frame + 60;
++}
++
+ // The NetLink's interrupt reaches the SCU as A-bus external interrupt 12 (vector 0x5C), where BOOT and
+ // the XBAND client install their UART handlers.
+ static const int kModemLine = 12;
+@@ -535,6 +625,7 @@ void master_poll_devices() {
+     sound_tick();
+     checkpoint_due();
+     progress_due();
++    rally_progress_poll();
+     state_poll();
+     if (g_slave_on && !g_slave_idle) to_slave();
+     if (g_cfg.stop_vblanks && sat_vblanks() >= g_cfg.stop_vblanks) sat_stop("VBlank limit");
+@@ -718,6 +809,7 @@ int saturn_main(const SaturnConfig& cfg) {
+     sound_close();
+     movie_finish();
+     mmio_log_write(cfg.out + "/hw-log.txt");
++    rally_progress_poll(true);
+     bios_save();
+     state_finish();
+     std::fflush(stderr);
 diff --git a/runtime/src/machine/onchip.cpp b/runtime/src/machine/onchip.cpp
 index 7cb090a..f67d1b3 100644
 --- a/runtime/src/machine/onchip.cpp
@@ -139,11 +453,68 @@ index 7cb090a..f67d1b3 100644
      if (off == 0x11 && size == 1) {         // FTCSR: a slave waiting here has nothing to do
          slave_idle_check(v);
          v = rd(o, off, size);
+diff --git a/runtime/src/machine/saturn.h b/runtime/src/machine/saturn.h
+index 3d1c67e..50ae8d2 100644
+--- a/runtime/src/machine/saturn.h
++++ b/runtime/src/machine/saturn.h
+@@ -130,6 +130,7 @@ uint32_t bios_rom_read(uint32_t a, int size);   // the few BIOS ROM words a prog
+ bool bios_is_dispatcher(uint32_t vec, uint32_t target);
+ void bios_dispatch(SH2Context& c, uint32_t vec);     // the handler SYS_SETUINT installed
+ void bios_save();                   // the backup memory to its file
++bool bios_store_rally_progress(const uint8_t* data, size_t size);
+ std::string sat_data_dir();         // the user's data directory by the platform's convention; empty if none
+ void bios_select_save(const uint8_t* ip);   // the save file for the disc with this IP.BIN, none loaded yet
+ struct DiscId { std::string product, version; };
 diff --git a/runtime/src/video/vdp1.cpp b/runtime/src/video/vdp1.cpp
-index 3562018..0f470c5 100644
+index 3562018..365b056 100644
 --- a/runtime/src/video/vdp1.cpp
 +++ b/runtime/src/video/vdp1.cpp
-@@ -209,6 +209,7 @@ static uint32_t g_dta;                          // a part of a cycle not yet cha
+@@ -39,6 +39,7 @@
+ #include <climits>
+ #include <cmath>
+ #include <cstdlib>
++#include <cstring>
+ #include <unordered_map>
+ 
+ uint8_t g_vdp1_vram[0x80000];
+@@ -47,6 +48,20 @@ static uint16_t* g_target = g_fb[0];            // where commands draw
+ static uint16_t g_hi[2][1024 * 512];            // each framebuffer's draw at full height, under FBCR.DIE
+ static bool g_hi_on[2];                         // ... drawn so
+ static uint16_t* g_hi_target;                   // the one being drawn, or null
++// Presentation-only progressive 2x buffers. The original framebuffer remains
++// the source for guest reads, DMA and save states.
++static std::vector<uint16_t> g_rally_hd[2];
++static bool g_rally_hd_valid[2];
++static uint16_t* g_rally_hd_target;
++// The 470x224 guest viewport has non-square pixels. Map its complete view
++// independently along each axis to the physical, square-pixel 1080p grid.
++static bool g_full_hd;
++static int hd_x(int x) { return g_full_hd ? (x * 1920 + (x >= 0 ? 235 : -235)) / 470 : x * 2; }
++static int hd_y(int y) { return g_full_hd ? (y * 1080 + (y >= 0 ? 112 : -112)) / 224 : y * 2; }
++static int hd_native_x(int x) { return g_full_hd ? ((2 * x + 1) * 470 - 1) / 3840 : x >> 1; }
++static int hd_native_y(int y) { return g_full_hd ? ((2 * y + 1) * 224 - 1) / 2160 : y >> 1; }
++static int hd_stride() { return g_full_hd ? 1920 : 1024; }
++static int hd_height() { return g_full_hd ? 1080 : 512; }
+ static int g_dil;                               // the field FBCR.DIL names for the framebuffer
+ static int g_draw_fb;                           // the other one is shown
+ static uint16_t g_reg[0x10];                    // TVMR FBCR PTMR EWDR EWLR EWRR ENDR - EDSR LOPR COPR MODR
+@@ -54,6 +69,7 @@ enum { TVMR, FBCR, PTMR, EWDR, EWLR, EWRR, ENDR, EDSR = 8, LOPR, COPR, MODR };
+ static bool g_change_pending, g_erase_pending, g_erase_field;
+ static bool g_drawing;
+ static uint64_t g_draw_end, g_frame_changes, g_draws;
++static uint64_t g_display_revision;
+ 
+ // the drawing state that outlives a draw
+ static int g_sys_x = 319, g_sys_y = 223;        // system clip: 0..x, 0..y
+@@ -62,6 +78,7 @@ static int g_local_x, g_local_y;
+ 
+ uint64_t vdp1_frame_changes() { return g_frame_changes; }
+ uint64_t vdp1_draws() { return g_draws; }
++uint64_t vdp1_display_revision() { return g_display_revision; }
+ 
+ void vdp1_init() {
+     g_reg[MODR] = 0x1000;                       // version 1
+@@ -209,6 +226,7 @@ static uint32_t g_dta;                          // a part of a cycle not yet cha
  // vdp1_raster_gpl.inc's, which follow Mednafen's and are under its licence, the GPL.
  #if SATURN_VDP1_GPL
  #include "vdp1_raster_gpl.inc"
@@ -151,7 +522,7 @@ index 3562018..0f470c5 100644
  #else
  #include "vdp1_raster.inc"
  #endif
-@@ -225,13 +226,17 @@ static void command(const uint8_t* cmd, uint32_t a) {
+@@ -225,13 +243,17 @@ static void command(const uint8_t* cmd, uint32_t a) {
      int comm = c.ctrl & 0xF;
      Pt p[4];
      for (int i = 0; i < 4; ++i) p[i] = {sx13(cw(cmd, 12 + i * 4)), sx13(cw(cmd, 14 + i * 4))};
@@ -171,7 +542,7 @@ index 3562018..0f470c5 100644
          return;
      case 0xA:                                   // local coordinates
          g_local_x = sx11(cw(cmd, 12)); g_local_y = sx11(cw(cmd, 14));
-@@ -257,7 +262,7 @@ static void command(const uint8_t* cmd, uint32_t a) {
+@@ -257,7 +279,7 @@ static void command(const uint8_t* cmd, uint32_t a) {
          uint32_t ga = (uint32_t)cw(cmd, 28) * 8;
          for (int i = 0; i < 4; ++i) c.g[i] = rgb_of(tw(ga + i * 2));
      }
@@ -180,8 +551,67 @@ index 3562018..0f470c5 100644
      draw_shape(c, cmd, comm, p);
  }
  
-@@ -324,13 +329,14 @@ static void draw() {
+@@ -298,6 +320,55 @@ static std::vector<uint64_t> g_next_keys;       // vdp1_next_draw_keys: by comma
+ 
+ void vdp1_next_draw_keys(std::vector<uint64_t> keys) { g_next_keys = std::move(keys); }
+ 
++bool rally_hd_ready() { return !g_show_ifb && g_rally_hd_valid[g_draw_fb ^ 1]; }
++
++int rally_hd_width() { return g_full_hd ? 1920 : 940; }
++
++const uint16_t* rally_hd_row(int y) {
++    const auto& fb = g_rally_hd[g_draw_fb ^ 1];
++    if ((unsigned)y >= (unsigned)hd_height() || fb.empty()) return nullptr;
++    return fb.data() + y * hd_stride();
++}
++
++uint16_t rally_hd_dot(int x, int y) {
++    if ((unsigned)x >= (unsigned)hd_stride()) return 0;
++    const uint16_t* row = rally_hd_row(y);
++    return row ? row[x] : 0;
++}
++
++static void mirror_hd_word(int which, unsigned pos) {
++    int x = pos % 512, y = pos / 512;
++    int left = hd_x(x), right = std::min(hd_x(x + 1), hd_stride());
++    if (left >= right) return;
++    for (int j = hd_y(y); j < std::min(hd_y(y + 1), hd_height()); ++j) {
++        auto* row = g_rally_hd[which].data() + j * hd_stride();
++        std::fill(row + left, row + right, g_fb[which][pos]);
++    }
++}
++
++static void begin_rally_hd() {
++#if !SATURN_VDP1_GPL
++    static const int mode = [] {
++        const char* setting = std::getenv("SR_NETLINK_HD");
++        if (setting) return !std::strcmp(setting, "1080") ? 1080 : !std::strcmp(setting, "1") ? 1 : 0;
++        return std::getenv("SR_NETLINK_RACE_BOOT") && std::getenv("SR_NETLINK_WIDE") ? 1 : 0;
++    }();
++    g_full_hd = mode == 1080;
++    if (mode && !g_fb8 && !g_hi_target && rally_course_scene()) {
++        auto& fb = g_rally_hd[g_draw_fb];
++        if (!g_rally_hd_valid[g_draw_fb]) {
++            fb.resize(hd_stride() * hd_height());
++            for (unsigned p = 0; p < 512 * 256; ++p) mirror_hd_word(g_draw_fb, p);
++            g_rally_hd_valid[g_draw_fb] = true;
++        }
++        g_rally_hd_target = fb.data();
++        return;
++    }
++#endif
++    g_rally_hd_valid[g_draw_fb] = false;
++    g_rally_hd_target = nullptr;
++}
++
+ uint16_t vdp1_dot(int x, int y, bool dd) {
+     if (x < 0 || y < 0) return 0;
+     if (g_show_ifb) return x < 512 && y < 256 ? g_ifb[y * 512 + x] : 0;
+@@ -322,15 +393,17 @@ static void draw() {
+     g_target = g_fb[g_draw_fb];
+     g_hi_on[g_draw_fb] = g_reg[FBCR] & 8;
      g_hi_target = g_hi_on[g_draw_fb] ? g_hi[g_draw_fb] : nullptr;
++    begin_rally_hd();
      g_dil = g_reg[FBCR] >> 2 & 1;
      RecDraw* rec = nullptr;
 -    if (g_cfg.interp) {
@@ -196,7 +626,15 @@ index 3562018..0f470c5 100644
      g_draw_cycles = 0;
      g_dta = 0;
      for (int guard = 0; guard < 20000; ++guard) {
-@@ -395,6 +401,7 @@ static void draw_between(float alpha) {
+@@ -364,6 +437,7 @@ static void draw() {
+         a &= 0x7FFFF;
+     }
+     g_next_keys.clear();
++    g_rally_hd_target = nullptr;
+     g_reg[LOPR] = (uint16_t)(last >> 3);
+     g_reg[COPR] = (uint16_t)(last >> 3);
+     ++g_draws;
+@@ -395,6 +469,7 @@ static void draw_between(float alpha) {
      int sx = g_sys_x, sy = g_sys_y, u0 = g_ux0, v0 = g_uy0, u1 = g_ux1, v1 = g_uy1, lx = g_local_x, ly = g_local_y;
      g_target = g_ifb;
      g_tex = L.vram.data();
@@ -204,15 +642,25 @@ index 3562018..0f470c5 100644
      int x0 = (L.ewlr >> 9 & 0x7F) * 8, y0 = L.ewlr & 0x1FF, x1 = (L.ewrr >> 9 & 0x7F) * 8, y1 = L.ewrr & 0x1FF;
      std::fill(g_ifb, g_ifb + 512 * 256, 0);
      for (int y = y0; y <= y1 && y < 256; ++y)
-@@ -612,6 +619,7 @@ void vdp1_tick(uint64_t now) {
+@@ -610,8 +685,17 @@ void vdp1_tick(uint64_t now) {
+ 
+ // ---- frames -------------------------------------------------------------------------------
  static void erase(int which) {
++    if (which == (g_draw_fb ^ 1)) ++g_display_revision;
      int x0 = (g_reg[EWLR] >> 9 & 0x7F) * 8, y0 = g_reg[EWLR] & 0x1FF;
      int x1 = (g_reg[EWRR] >> 9 & 0x7F) * 8, y1 = g_reg[EWRR] & 0x1FF;
 +    if (x0 == 0 && x1 >= 320) x1 = std::min(512, x1 + 2 * rally_wide_margin());
++    if (g_rally_hd_valid[which] && x0 < std::min(x1, 512)) {
++        const int left = std::min(hd_x(x0), hd_stride()), right = std::min(hd_x(x1), hd_stride());
++        for (int y = hd_y(y0); y < std::min(hd_y(y1 + 1), hd_height()); ++y) {
++            auto* row = g_rally_hd[which].data() + y * hd_stride();
++            std::fill(row + left, row + right, g_reg[EWDR]);
++        }
++    }
      for (int y = y0; y <= y1 && y < 256; ++y)
          for (int x = x0; x < x1 && x < 512; ++x) g_fb[which][y * 512 + x] = g_reg[EWDR];
      if (!g_hi_on[which]) return;
-@@ -631,7 +639,7 @@ void vdp1_vblank_out() {
+@@ -631,7 +715,7 @@ void vdp1_vblank_out() {
          g_change_pending = false;
          g_draw_fb ^= 1;
          ++g_frame_changes;
@@ -221,26 +669,61 @@ index 3562018..0f470c5 100644
              g_rec_prev = std::move(g_rec_last);
              g_rec_last = std::move(g_rec_cur);
              g_rec_cur = RecFrame{};
+@@ -684,10 +768,16 @@ uint32_t vdp1_fb_read(uint32_t off, int size) {
+ 
+ void vdp1_fb_write(uint32_t off, uint32_t v, int size) {
+     uint16_t* fb = g_fb[g_draw_fb];
+-    if (size == 4) { fb[(off >> 1) & 0x1FFFF] = (uint16_t)(v >> 16); fb[((off >> 1) + 1) & 0x1FFFF] = (uint16_t)v; return; }
++    if (size == 4) {
++        const unsigned p = (off >> 1) & 0x1FFFF, q = (p + 1) & 0x1FFFF;
++        fb[p] = (uint16_t)(v >> 16); fb[q] = (uint16_t)v;
++        if (g_rally_hd_valid[g_draw_fb]) { mirror_hd_word(g_draw_fb, p); mirror_hd_word(g_draw_fb, q); }
++        return;
++    }
+     uint16_t& w = fb[(off >> 1) & 0x1FFFF];
+     if (size == 2) w = (uint16_t)v;
+     else w = off & 1 ? (uint16_t)((w & 0xFF00) | (v & 0xFF)) : (uint16_t)((w & 0x00FF) | (v & 0xFF) << 8);
++    if (g_rally_hd_valid[g_draw_fb]) mirror_hd_word(g_draw_fb, (off >> 1) & 0x1FFFF);
+ }
+ 
+ void vdp1_dump(FILE* f) {
+@@ -706,6 +796,9 @@ void vdp1_state(State& s) {
+     int8_t hi_target = g_hi_target == g_hi[0] ? 0 : g_hi_target == g_hi[1] ? 1 : -1;
+     s(target), s(hi_target);
+     if (s.loading) {
++        ++g_display_revision;
++        g_rally_hd_valid[0] = g_rally_hd_valid[1] = false;
++        g_rally_hd_target = nullptr;
+         if (target < 0) state_fail("VDP1 was drawing a frame in between");
+         g_target = g_fb[target];
+         g_hi_target = hi_target < 0 ? nullptr : g_hi[hi_target];
 diff --git a/runtime/src/video/vdp1_raster.inc b/runtime/src/video/vdp1_raster.inc
-index c0a8983..c6597b2 100644
+index c0a8983..179e317 100644
 --- a/runtime/src/video/vdp1_raster.inc
 +++ b/runtime/src/video/vdp1_raster.inc
-@@ -24,7 +24,63 @@
+@@ -24,12 +24,145 @@
  
  static bool outside_clip(const Cmd& c, int x0, int y0, int x1, int y1);
  
 -static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1) {
+-    if (outside_clip(c, std::min(p0.x, p1.x), std::min(p0.y, p1.y), std::max(p0.x, p1.x), std::max(p0.y, p1.y))) return;
 +// A single race draw can repeat the same small tile hundreds of times. Build the
 +// summed-area table once per texture/palette pair. Discard it at the next draw,
 +// since the game can upload different texels or colours to the same VRAM address.
 +using TileSums = std::vector<Rgb>;
 +static std::unordered_map<uint64_t, TileSums> g_tile_sums;
++struct RallyTexture {
++    std::vector<uint16_t> pixels;
++    bool opaque = true, zero_colour = false;
++};
++static std::unordered_map<uint64_t, RallyTexture> g_rally_textures;
 +static bool g_filter_race_tiles;
 +
 +static void begin_tile_filter() {
 +    static const bool rally = std::getenv("SR_NETLINK_RACE_BOOT") != nullptr;
-+    g_filter_race_tiles = rally && (g_wram_h[0xAA8E7] & 0x1F) == 0x1C;
++    g_filter_race_tiles = rally && rally_course_scene();
 +    g_tile_sums.clear();
++    g_rally_textures.clear();
 +}
 +
 +static const TileSums* opaque_tile(const Cmd& c) {
@@ -285,16 +768,95 @@ index c0a8983..c6597b2 100644
 +    return (uint16_t)(0x8000 | r | g << 5 | blue << 10);
 +}
 +
-+static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1,
++// The race's ordinary four-bit lookup-table spans use replace, transparent
++// index zero and disabled end codes. Skip off-screen steps, preserving the
++// Bresenham error and the original texture column at the first visible dot.
++template<bool hd>
++static void rally_palette_line(const Cmd& c, Pt a, Pt b, int v) {
++    constexpr int scale = hd ? 2 : 1;
++    constexpr int stride = 512 * scale;
++    int x0 = 0, y0 = 0;
++    int x1 = std::min(g_sys_x + 1, 512) * scale - 1;
++    int y1 = std::min(g_sys_y + 1, 256) * scale - 1;
++    if (c.clip) {
++        x0 = std::max(x0, g_ux0 * scale);
++        y0 = std::max(y0, g_uy0 * scale);
++        x1 = std::min(x1, (g_ux1 + 1) * scale - 1);
++        y1 = std::min(y1, (g_uy1 + 1) * scale - 1);
++    }
++    const int dx = b.x - a.x, dy = b.y - a.y;
++    const bool horizontal = std::abs(dx) >= std::abs(dy);
++    int major = horizontal ? a.x : a.y, minor = horizontal ? a.y : a.x;
++    const int dmajor = horizontal ? dx : dy, dminor = horizontal ? dy : dx;
++    const int major_step = dmajor < 0 ? -1 : 1, minor_step = dminor < 0 ? -1 : 1;
++    const int n = std::abs(dmajor), m = std::abs(dminor);
++    const int lo = horizontal ? x0 : y0, hi = horizontal ? x1 : y1;
++    const int lower = horizontal ? y0 : x0, upper = horizontal ? y1 : x1;
++    const int first = std::max(0, major_step > 0 ? lo - major : major - hi);
++    const int last = std::min(n, major_step > 0 ? hi - major : major - lo);
++    if (first > last) return;
++
++    const int minor_steps = first ? (first * m + (n - 1) / 2) / n : 0;
++    major += first * major_step;
++    minor += minor_steps * minor_step;
++    int err = 2 * (m + first * m - minor_steps * n) - n;
++    const int cols = n + 1;
++    int u = first * c.w / cols, rem = first * c.w - u * cols;
++    const int du = c.w / cols, dr = c.w % cols;
++    const uint32_t row = c.srca + (c.vflip ? c.h - 1 - v : v) * c.w / 2;
++    uint16_t* target = hd ? g_rally_hd_target : g_target;
++    for (int k = first; k <= last; ++k) {
++        const int column = c.hflip ? c.w - 1 - u : u;
++        const uint8_t pair = g_tex[(row + (column >> 1)) & 0x7FFFF];
++        const int index = (column & 1) ? pair & 15 : pair >> 4;
++        auto emit = [&] {
++            if (index && minor >= lower && minor <= upper)
++                target[horizontal ? minor * stride + major : major * stride + minor] = c.lut[index];
++        };
++        emit();
++        if (err > 0 && k < n) {
++            minor += minor_step;
++            err -= 2 * n;
++            emit();
++        }
++        major += major_step;
++        err += 2 * m;
++        u += du;
++        rem += dr;
++        if (rem >= cols) { ++u; rem -= cols; }
++    }
++}
++
++template<bool hd>
++static void raster_line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1,
 +                 const TileSums* sums = nullptr, int v1 = 0) {
-     if (outside_clip(c, std::min(p0.x, p1.x), std::min(p0.y, p1.y), std::max(p0.x, p1.x), std::max(p0.y, p1.y))) return;
++    Pt n0 = p0, n1 = p1;
++    if constexpr (hd) {
++        n0 = {hd_native_x(p0.x), hd_native_y(p0.y)};
++        n1 = {hd_native_x(p1.x), hd_native_y(p1.y)};
++    }
++    if (outside_clip(c, std::min(n0.x, n1.x), std::min(n0.y, n1.y),
++                     std::max(n0.x, n1.x), std::max(n0.y, n1.y))) return;
      int dx = p1.x - p0.x, dy = p1.y - p0.y;
      int adx = std::abs(dx), ady = std::abs(dy);
-@@ -39,7 +95,10 @@ static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1) {
+     int len = std::max(adx, ady);
+-    g_draw_steps += (uint64_t)len + 1;
++    if constexpr (!hd) g_draw_steps += (uint64_t)len + 1;
++    if ((!hd || !g_full_hd) && g_filter_race_tiles && c.textured && !sums && !g_fb8 && !g_hi_target &&
++        (c.pmod == 0x1888 || c.pmod == 0x1488)) {
++        rally_palette_line<hd>(c, p0, p1, v);
++        return;
++    }
+     int xi = dx < 0 ? -1 : 1, yi = dy < 0 ? -1 : 1;
+     int ends = 0;
+     bool stop = false;
+@@ -38,15 +171,28 @@ static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1) {
+         uint16_t pix = c.colr;
          if (c.textured) {
              bool end;
-             int u = (int)((int64_t)k * c.w / (len + 1));
+-            int u = (int)((int64_t)k * c.w / (len + 1));
 -            if (!texel(c, u, v, pix, end)) {
++            int u = k * c.w / (len + 1);
 +            if (sums) {
 +                int u1 = std::max(u + 1, (k + 1) * c.w / (len + 1));
 +                pix = mean_texel(c, *sums, u, v, u1, v1);
@@ -302,10 +864,47 @@ index c0a8983..c6597b2 100644
                  if (end && ++ends == 2) stop = true;
                  return;
              }
-@@ -98,13 +157,27 @@ static void quad(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
+         }
+         Rgb g;
+         if (c.gouraud) g = mix(g0, g1, k, len);
+-        plot(c, x, y, pix, c.gouraud ? &g : nullptr);
++        if constexpr (hd) {
++            int sx = hd_native_x(x), sy = hd_native_y(y);
++            if ((unsigned)x >= (unsigned)hd_stride() || (unsigned)y >= (unsigned)hd_height() || sx > g_sys_x || sy > g_sys_y) return;
++            if (c.clip && (sx >= g_ux0 && sx <= g_ux1 && sy >= g_uy0 && sy <= g_uy1) == c.outside) return;
++            if (c.mesh && ((sx ^ sy) & 1)) return;
++            auto& dst = g_rally_hd_target[y * hd_stride() + x];
++            if (!c.mon && c.ccb == 0) dst = pix;
++            else put(dst, c, pix, c.gouraud ? &g : nullptr);
++        } else {
++            plot(c, x, y, pix, c.gouraud ? &g : nullptr);
++        }
+     };
+     int x = p0.x, y = p0.y;
+     if (adx >= ady) {
+@@ -90,24 +236,207 @@ static bool outside_clip(const Cmd& c, int x0, int y0, int x1, int y1) {
+     return c.clip && !c.outside && (x1 < g_ux0 || y1 < g_uy0 || x0 > g_ux1 || y0 > g_uy1);
+ }
+ 
+-static void quad(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
+-    if (outside_clip(c, std::min({a.x, b.x, cc.x, d.x}), std::min({a.y, b.y, cc.y, d.y}),
+-                     std::max({a.x, b.x, cc.x, d.x}), std::max({a.y, b.y, cc.y, d.y})))
+-        return;
++template<bool hd>
++static void raster_quad(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
++    int xmin = std::min({a.x, b.x, cc.x, d.x}), xmax = std::max({a.x, b.x, cc.x, d.x});
++    int ymin = std::min({a.y, b.y, cc.y, d.y}), ymax = std::max({a.y, b.y, cc.y, d.y});
++    if constexpr (hd) {
++        xmin = hd_native_x(xmin); xmax = hd_native_x(xmax);
++        ymin = hd_native_y(ymin); ymax = hd_native_y(ymax);
++    }
++    if (outside_clip(c, xmin, ymin, xmax, ymax)) return;
+     int left = std::max(std::abs(d.x - a.x), std::abs(d.y - a.y));
      int right = std::max(std::abs(cc.x - b.x), std::abs(cc.y - b.y));
      int n = std::max(left, right);
-     if (n > 2048) return;                       // a shape far off the framebuffer: the chip would spend ages on it
+-    if (n > 2048) return;                       // a shape far off the framebuffer: the chip would spend ages on it
+-    for (int i = 0; i <= n && g_draw_steps < kDrawSteps; ++i) {
++    if (n > (hd && g_full_hd ? 10000 : 2048 << hd)) return;
 +    const TileSums* sums = nullptr;
 +    // The course uses palette VRAM from 0x15000 and textures above the vehicle
 +    // banks. Leave cars, fonts, masks, palette priority codes and effects alone.
@@ -317,7 +916,7 @@ index c0a8983..c6597b2 100644
 +        if (2 * std::min(near, far) <= c.w || 2 * (n + 1) <= c.h)
 +            sums = opaque_tile(c);
 +    }
-     for (int i = 0; i <= n && g_draw_steps < kDrawSteps; ++i) {
++    for (int i = 0; i <= n && (hd || g_draw_steps < kDrawSteps); ++i) {
          Pt l{step_to(a.x, d.x, i, n), step_to(a.y, d.y, i, n)};
          Pt r{step_to(b.x, cc.x, i, n), step_to(b.y, cc.y, i, n)};
          int v = c.textured ? (int)((int64_t)i * c.h / (n + 1)) : 0;
@@ -327,12 +926,192 @@ index c0a8983..c6597b2 100644
 +        const int span = std::max(std::abs(l.x - r.x), std::abs(l.y - r.y)) + 1;
 +        const TileSums* filtered = sums && (2 * span <= c.w || 2 * (n + 1) <= c.h) ? sums : nullptr;
 +        int v1 = filtered ? std::max(v + 1, (i + 1) * c.h / (n + 1)) : 0;
-+        line(c, l, r, v, gl, gr, filtered, v1);
++        raster_line<hd>(c, l, r, v, gl, gr, filtered, v1);
      }
  }
  
++static Pt hd_point(Pt p) { return {hd_x(p.x), hd_y(p.y)}; }
++
++static const RallyTexture& rally_texture(const Cmd& c) {
++    const uint64_t key = (uint64_t)c.srca << 40 | (uint64_t)c.colr << 24 |
++                         (uint64_t)c.w << 8 | (unsigned)c.h;
++    auto [it, fresh] = g_rally_textures.try_emplace(key);
++    RallyTexture& texture = it->second;
++    if (fresh) {
++        texture.pixels.resize(c.w * c.h);
++        for (int i = 0; i < c.w * c.h; ++i) {
++            const unsigned pair = g_tex[(c.srca + i / 2) & 0x7FFFF];
++            const unsigned index = i & 1 ? pair & 15 : pair >> 4;
++            texture.pixels[i] = index ? c.lut[index] : 0;
++            if (!index) texture.opaque = false;
++            else if (!c.lut[index]) texture.zero_colour = true;
++        }
++    }
++    return texture;
++}
++
++struct SurfaceVertex { float x, y, u, v; };
++struct SurfaceClip { int x0, x1, y0, y1; };
++
++template<bool opaque>
++static inline void surface_texels(uint16_t* dst, int count, const uint16_t* texture,
++                                  int w, int h, int u, int v, int du, int dv) {
++    for (int i = 0; i < count; ++i) {
++        const int tx = std::clamp(u >> 12, 0, w - 1);
++        const int ty = std::clamp(v >> 12, 0, h - 1);
++        uint16_t colour = texture[ty * w + tx];
++        if (opaque || colour) dst[i] = colour;
++        u += du; v += dv;
++    }
++}
++
++// Scan-convert a strip of the bilinear command surface on the output grid.
++// Texel coordinates advance across contiguous physical pixels. The half-open
++// edges give adjacent triangles a shared edge without drawing it twice.
++static void surface_triangle(const Cmd& c, const RallyTexture* texture, const SurfaceClip& clip,
++                             SurfaceVertex a, SurfaceVertex b, SurfaceVertex d) {
++    if (b.y < a.y) std::swap(a, b);
++    if (d.y < a.y) std::swap(a, d);
++    if (d.y < b.y) std::swap(b, d);
++    const float bx = b.x - a.x, by = b.y - a.y, dx = d.x - a.x, dy = d.y - a.y;
++    const float det = bx * dy - dx * by;
++    if (std::abs(det) < 0.001f) return;
++    const int top = std::max(clip.y0, (int)std::ceil(a.y - 0.5f));
++    const int bottom = std::min(clip.y1, (int)std::ceil(d.y - 0.5f));
++    if (top >= bottom) return;
++    const float ux = ((b.u - a.u) * dy - (d.u - a.u) * by) / det;
++    const float vx = ((b.v - a.v) * dy - (d.v - a.v) * by) / det;
++    const float uy = (bx * (d.u - a.u) - dx * (b.u - a.u)) / det;
++    const float vy = (bx * (d.v - a.v) - dx * (b.v - a.v)) / det;
++    // A subpixel sliver can have a steep gradient and cover only one sample.
++    const int du = (int)std::clamp(ux * 4096.f, -67108864.f, 67108864.f);
++    const int dv = (int)std::clamp(vx * 4096.f, -67108864.f, 67108864.f);
++    const float outer_dx = dx / dy;
++    auto half = [&](int first, int last, const SurfaceVertex& p, const SurfaceVertex& q) {
++        if (first >= last) return;
++        const float inner_dx = (q.x - p.x) / (q.y - p.y);
++        for (int y = first; y < last; ++y) {
++            const float sy = y + 0.5f;
++            const float l = a.x + (sy - a.y) * outer_dx;
++            const float r = p.x + (sy - p.y) * inner_dx;
++            const int left = std::max(clip.x0, (int)std::ceil(std::min(l,r) - 0.5f));
++            const int right = std::min(clip.x1, (int)std::ceil(std::max(l,r) - 0.5f));
++            if (right <= left) continue;
++            uint16_t* dst = g_rally_hd_target + y * 1920 + left;
++            if (!texture) {
++                std::fill(dst, dst + (right - left), c.colr);
++                continue;
++            }
++            const float ox = left + 0.5f - a.x, oy = sy - a.y;
++            const int u = (int)(std::clamp(a.u + ox * ux + oy * uy, 0.f, (float)c.w) * 4096.f);
++            const int v = (int)(std::clamp(a.v + ox * vx + oy * vy, 0.f, (float)c.h) * 4096.f);
++            if (texture->opaque) surface_texels<true>(dst, right-left, texture->pixels.data(), c.w, c.h, u, v, du, dv);
++            else surface_texels<false>(dst, right-left, texture->pixels.data(), c.w, c.h, u, v, du, dv);
++        }
++    };
++    const int split = std::clamp((int)std::ceil(b.y - 0.5f), top, bottom);
++    half(top, split, a, b);
++    half(split, bottom, b, d);
++}
++
++static bool full_hd_surface(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
++    const bool palette = c.textured && (c.pmod == 0x1488 || c.pmod == 0x1888);
++    const bool solid = !c.textured && !c.ccb && !c.mesh && !c.mon && !c.outside;
++    if (!palette && !solid) return false;
++    SurfaceClip clip{0, std::min(1920, hd_x(g_sys_x + 1)), 0, std::min(1080, hd_y(g_sys_y + 1))};
++    if (c.clip) {
++        clip.x0 = std::max(0, hd_x(g_ux0)); clip.y0 = std::max(0, hd_y(g_uy0));
++        clip.x1 = std::min(clip.x1, hd_x(g_ux1 + 1)); clip.y1 = std::min(clip.y1, hd_y(g_uy1 + 1));
++    }
++    if (std::max({a.x,b.x,cc.x,d.x}) < clip.x0 || std::min({a.x,b.x,cc.x,d.x}) >= clip.x1 ||
++        std::max({a.y,b.y,cc.y,d.y}) < clip.y0 || std::min({a.y,b.y,cc.y,d.y}) >= clip.y1) return true;
++    const RallyTexture* texture = palette ? &rally_texture(c) : nullptr;
++    if (texture && texture->zero_colour) return false;
++    // VDP1 paints the full source dot along independently rounded projected
++    // edges. A mathematical zero-width edge can expose sky between two tiles
++    // whose endpoints differ by a source dot. Keep half that footprint on
++    // course tiles while sampling their interior at full resolution.
++    if (palette && c.colr >= 0x15000 / 8 && c.srca >= 0x38000) {
++        const Pt corners[4]{a,b,cc,d};
++        Pt* expanded[4]{&a,&b,&cc,&d};
++        float area = 0;
++        for (int i = 0; i < 4; ++i) {
++            const Pt p = corners[i], q = corners[(i + 1) & 3];
++            area += (float)p.x * q.y - (float)p.y * q.x;
++        }
++        struct Normal { float x, y; } normals[4];
++        for (int i = 0; i < 4; ++i) {
++            const Pt p = corners[i], q = corners[(i + 1) & 3];
++            const float x = (float)(q.y - p.y), y = (float)(p.x - q.x);
++            const float inv = (area < 0 ? -1.f : 1.f) / std::max(1.f, std::sqrt(x*x + y*y));
++            normals[i] = {x*inv,y*inv};
++        }
++        for (int i = 0; i < 4; ++i) {
++            const auto prev = normals[(i + 3) & 3], next = normals[i];
++            const float scale = 2.5f / std::max(0.1f, 1.f + prev.x*next.x + prev.y*next.y);
++            expanded[i]->x += (int)std::round(std::clamp((prev.x + next.x)*scale, -5.f, 5.f));
++            expanded[i]->y += (int)std::round(std::clamp((prev.y + next.y)*scale, -5.f, 5.f));
++        }
++    }
++    const float u0 = c.hflip ? (float)c.w : 0.f, u1 = c.hflip ? 0.f : (float)c.w;
++    const float v0 = c.vflip ? (float)c.h : 0.f, v1 = c.vflip ? 0.f : (float)c.h;
++    // A trapezoid's texture has a bilinear cross-term. Subdivide it so one
++    // affine diagonal does not distort a road or the side of a vehicle.
++    int warp = std::max(std::abs(a.x + cc.x - b.x - d.x), std::abs(a.y + cc.y - b.y - d.y));
++    int strips = texture ? std::clamp(1 + warp / 16, 1, 32) : 1;
++    SurfaceVertex left{(float)a.x,(float)a.y,u0,v0}, right{(float)b.x,(float)b.y,u1,v0};
++    for (int i = 1; i <= strips; ++i) {
++        const float t = (float)i / strips, v = v0 + t * (v1 - v0);
++        SurfaceVertex next_l{a.x + (d.x-a.x)*t, a.y + (d.y-a.y)*t, u0, v};
++        SurfaceVertex next_r{b.x + (cc.x-b.x)*t, b.y + (cc.y-b.y)*t, u1, v};
++        surface_triangle(c, texture, clip, left, right, next_r);
++        surface_triangle(c, texture, clip, left, next_r, next_l);
++        left = next_l; right = next_r;
++    }
++    return true;
++}
++
++static void quad(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
++    raster_quad<false>(c, a, b, cc, d);
++    if (!g_rally_hd_target) return;
++    if ((c.ctrl & 15) <= 1) {
++        // Sprites specify inclusive opposite corners, including one-dot text.
++        const bool right = a.x <= b.x, down = a.y <= d.y;
++        if (right) { ++b.x; ++cc.x; } else { ++a.x; ++d.x; }
++        if (down) { ++d.y; ++cc.y; } else { ++a.y; ++b.y; }
++        a = hd_point(a); b = hd_point(b); cc = hd_point(cc); d = hd_point(d);
++        if (right) { --b.x; --cc.x; } else { --a.x; --d.x; }
++        if (down) { --d.y; --cc.y; } else { --a.y; --b.y; }
++    } else {
++        a = hd_point(a); b = hd_point(b); cc = hd_point(cc); d = hd_point(d);
++        if (g_full_hd && full_hd_surface(c, a, b, cc, d)) return;
++    }
++    raster_quad<true>(c, a, b, cc, d);
++}
++
++static void line(const Cmd& c, Pt a, Pt b, int v, Rgb g0, Rgb g1) {
++    raster_line<false>(c, a, b, v, g0, g1);
++    if (g_rally_hd_target) raster_line<true>(c, hd_point(a), hd_point(b), v, g0, g1);
++}
++
+ struct ClipBox { int x0, y0, x1, y1; };
+ 
+ static ClipBox clip_box(const Cmd& c) {
+@@ -123,6 +452,12 @@ static ClipBox clip_box(const Cmd& c) {
+ // it never enters it.
+ static int dots_until_exit(Pt a, Pt b, const ClipBox& box) {
+     int n = std::max(std::abs(b.x - a.x), std::abs(b.y - a.y));
++    // Both coordinates of a raster line are monotone. Most visible spans
++    // therefore have no transition through a clip edge.
++    const int xmin = std::min(a.x, b.x), xmax = std::max(a.x, b.x);
++    const int ymin = std::min(a.y, b.y), ymax = std::max(a.y, b.y);
++    if ((xmin >= box.x0 && xmax <= box.x1 && ymin >= box.y0 && ymax <= box.y1) ||
++        xmax < box.x0 || xmin > box.x1 || ymax < box.y0 || ymin > box.y1) return n + 1;
+     bool inside = false;
+     for (int i = 0; i <= n; ++i) {
+         int x = step_to(a.x, b.x, i, n), y = step_to(a.y, b.y, i, n);
 diff --git a/runtime/src/video/vdp2.cpp b/runtime/src/video/vdp2.cpp
-index 4c8bcb1..c9de73a 100644
+index 4c8bcb1..cf4fef1 100644
 --- a/runtime/src/video/vdp2.cpp
 +++ b/runtime/src/video/vdp2.cpp
 @@ -21,7 +21,8 @@
@@ -345,15 +1124,17 @@ index 4c8bcb1..c9de73a 100644
  // mosaic, the sprite window, special priority and colour calculation by dot
  // (the special function codes), gradation of RBG0, extended colour
  // calculation, the exclusive resolutions. A register that asks for one of them is noted once.
-@@ -30,6 +31,7 @@
+@@ -29,7 +30,9 @@
+ #include "state.h"
  #include "video.h"
  #include <algorithm>
++#include <array>
  #include <cstring>
 +#include <cstdlib>
  #include <vector>
  
  uint8_t g_vdp2_vram[0x80000], g_vdp2_cram[0x1000], g_vdp2_regs[0x200];
-@@ -100,7 +102,7 @@ struct Pix {
+@@ -100,7 +103,7 @@ struct Pix {
      bool shade;                                 // an MSB shadow: the sprite dot at half brightness
  };
  
@@ -362,17 +1143,18 @@ index 4c8bcb1..c9de73a 100644
  
  // ---- the scroll screens ---------------------------------------------------------------------
  struct Nbg {
-@@ -108,7 +110,8 @@ struct Nbg {
+@@ -108,7 +111,9 @@ struct Nbg {
      int colors;                                 // 0 16, 1 256, 2 2048, 3 32K RGB, 4 16M RGB
      uint16_t supp;                              // the pattern name supplement
      int plane_w, plane_h;                       // in pages
 -    uint32_t plane[4];                          // A B C D: VRAM addresses
++    int plane_x_shift, plane_y_shift, cell_shift;
 +    uint32_t plane[16];                         // 2x2 normal or 4x4 rotation map
 +    int map_width, overflow;
      uint32_t page_bytes;
      int bm_w, bm_h;                             // bitmap size
      uint32_t bm_addr;
-@@ -122,18 +125,23 @@ struct Nbg {
+@@ -122,18 +127,23 @@ struct Nbg {
  
  static void setup_nbg(int n, Nbg& s) {
      s = Nbg{};
@@ -399,7 +1181,7 @@ index 4c8bcb1..c9de73a 100644
          s.bm_w = bmsz & 2 ? 1024 : 512;
          s.bm_h = bmsz & 1 ? 512 : 256;
      } else {
-@@ -145,33 +153,37 @@ static void setup_nbg(int n, Nbg& s) {
+@@ -145,33 +155,40 @@ static void setup_nbg(int n, Nbg& s) {
      s.word1 = pncn >> 15 & 1;
      s.cnsm = pncn >> 14 & 1;
      s.supp = pncn & 0x3FF;
@@ -411,6 +1193,9 @@ index 4c8bcb1..c9de73a 100644
      s.plane_w = plsz == 0 ? 1 : 2;
      s.plane_h = plsz == 3 ? 2 : 1;
 -    uint32_t mpof = reg(0x3C) >> (n * 4) & 7;
++    s.plane_x_shift = s.plane_w == 2 ? 10 : 9;
++    s.plane_y_shift = s.plane_h == 2 ? 10 : 9;
++    s.cell_shift = s.cell2x2 ? 4 : 3;
 +    uint32_t mpof = rot ? reg(0x3E) >> (param * 4) & 7 : reg(0x3C) >> (n * 4) & 7;
      s.page_bytes = (s.cell2x2 ? 0x800u : 0x2000u) * (s.word1 ? 1 : 2);
      uint32_t mask = (uint32_t)(s.plane_w * s.plane_h - 1);
@@ -444,7 +1229,7 @@ index 4c8bcb1..c9de73a 100644
          uint32_t b = 0x90 + (n - 2) * 4;
          s.sx = (int32_t)(reg(b) & 0x7FF) << 8;
          s.sy = (int32_t)(reg(b + 2) & 0x7FF) << 8;
-@@ -215,9 +227,10 @@ static bool dot(const Nbg& s, uint32_t base, int x, int y, int width, uint32_t p
+@@ -215,9 +232,10 @@ static bool dot(const Nbg& s, uint32_t base, int x, int y, int width, uint32_t p
      return true;
  }
  
@@ -457,21 +1242,39 @@ index 4c8bcb1..c9de73a 100644
          sx &= (uint32_t)s.bm_w - 1;
          sy &= (uint32_t)s.bm_h - 1;
          p.spr = s.bm_spr;
-@@ -225,9 +238,10 @@ static bool nbg_pixel(const Nbg& s, int x, int y, Pix& p) {
+@@ -225,14 +243,15 @@ static bool nbg_pixel(const Nbg& s, int x, int y, Pix& p) {
          return dot(s, s.bm_addr, (int)sx, (int)sy, s.bm_w, s.bm_pal, p);
      }
      uint32_t pw = (uint32_t)s.plane_w * 512, ph = (uint32_t)s.plane_h * 512;
 -    sx &= pw * 2 - 1;                            // the map: 2x2 planes
 -    sy &= ph * 2 - 1;
 -    int pl = (sy >= ph ? 2 : 0) + (sx >= pw ? 1 : 0);
+-    uint32_t ix = sx % pw, iy = sy % ph;
 +    if (s.overflow == 2 && (sx >= pw * s.map_width || sy >= ph * s.map_width)) return false;
 +    sx &= pw * s.map_width - 1;
 +    sy &= ph * s.map_width - 1;
-+    int pl = (sy / ph) * s.map_width + sx / pw;
-     uint32_t ix = sx % pw, iy = sy % ph;
++    int pl = (sy >> s.plane_y_shift) * s.map_width + (sx >> s.plane_x_shift);
++    uint32_t ix = sx & (pw - 1), iy = sy & (ph - 1);
      uint32_t page = (iy / 512) * (uint32_t)s.plane_w + ix / 512;
-     int cs = s.cell2x2 ? 16 : 8;
-@@ -267,6 +281,50 @@ static bool nbg_pixel(const Nbg& s, int x, int y, Pix& p) {
+-    int cs = s.cell2x2 ? 16 : 8;
+-    uint32_t cx = (ix % 512) / (uint32_t)cs, cy = (iy % 512) / (uint32_t)cs;
+-    uint32_t cpr = 512 / (uint32_t)cs;
++    int cs = 1 << s.cell_shift;
++    uint32_t cx = (ix & 511) >> s.cell_shift, cy = (iy & 511) >> s.cell_shift;
++    uint32_t cpr = 512u >> s.cell_shift;
+     uint32_t pnd_addr = s.plane[pl] + page * s.page_bytes + (cy * cpr + cx) * (s.word1 ? 2 : 4);
+     uint32_t chr, pal;
+     bool hf, vf;
+@@ -258,7 +277,7 @@ static bool nbg_pixel(const Nbg& s, int x, int y, Pix& p) {
+         pal = w0 & 0x7F;
+         chr = w1 & 0x7FFF;
+     }
+-    int px = (int)(ix % (uint32_t)cs), py = (int)(iy % (uint32_t)cs);
++    int px = (int)ix & (cs - 1), py = (int)iy & (cs - 1);
+     if (hf) px = cs - 1 - px;
+     if (vf) py = cs - 1 - py;
+     static const uint32_t kCellBytes[] = {32, 64, 128, 128, 256};
+@@ -267,6 +286,50 @@ static bool nbg_pixel(const Nbg& s, int x, int y, Pix& p) {
      return dot(s, base, px & 7, py & 7, 8, pal, p);
  }
  
@@ -522,7 +1325,7 @@ index 4c8bcb1..c9de73a 100644
  // ---- the sprite layer -----------------------------------------------------------------------
  struct SpriteType { int pr_shift, pr_mask, cc_shift, cc_mask, dc_mask; };
  static const SpriteType kTypes[16] = {
-@@ -367,7 +425,8 @@ static void note_unsupported() {
+@@ -367,7 +430,8 @@ static void note_unsupported() {
      auto once = [&](int i, bool cond, const char* what, uint16_t v) {
          if (cond && !noted[i]) { noted[i] = fresh = true; sat_note("VDP2: %s (%04X) is not done", what, v); }
      };
@@ -532,15 +1335,45 @@ index 4c8bcb1..c9de73a 100644
      once(1, reg(0x9A) & 0x3F3F, "line or vertical cell scroll (SCRCTL)", reg(0x9A));
      once(2, reg(0x22) & 0xF, "mosaic (MZCTL)", reg(0x22));
      once(3, (reg(0xD0) | reg(0xD2) | reg(0xD4) | reg(0xD6)) & 0x2020, "the sprite window (WCTL)", reg(0xD0));
-@@ -393,18 +452,96 @@ static uint32_t apply_offset(uint32_t rgb, bool b) {
+@@ -393,18 +457,134 @@ static uint32_t apply_offset(uint32_t rgb, bool b) {
      return (uint32_t)out;
  }
  
++// In the course's unblended, uniform-priority sprite mode every 16-bit dot
++// selects an RGB colour, a transparent dot or a normal shadow. The RGB half of
++// the table is constant. The other half repeats the active 2048-entry palette.
++constexpr uint32_t transparent_dot = 0x1000000, shadow_dot = 0x1000001;
++static const uint32_t* race_sprite_colors() {
++    static std::array<uint32_t, 65536> colors = [] {
++        std::array<uint32_t, 65536> table{};
++        for (int d = 0x8000; d < 0x10000; ++d) table[d] = rgb555((uint16_t)d);
++        return table;
++    }();
++    const unsigned offset = (reg(0xe6) >> 4 & 7) * 256;
++    for (int i = 0; i < 2048; ++i) colors[i] = cram(i + offset, nullptr);
++    colors[0] = transparent_dot;
++    colors[0x7fe] = shadow_dot;
++    for (int base = 2048; base < 0x8000; base *= 2)
++        std::copy_n(colors.data(), base, colors.data() + base);
++    return colors.data();
++}
++
 +// The VDP1 framebuffer is 512 pixels wide in the low-resolution mode the game uses.
 +int rally_wide_margin() {
 +    static const bool enabled = std::getenv("SR_NETLINK_WIDE") != nullptr;
 +    if (!enabled) return 0;
 +    return (reg(0) & 1) ? 59 : 53;
++}
++
++// The introduction, replays and credits drive the same camera without the race HUD.
++bool rally_course_scene() {
++    const unsigned layers = reg(0x20) & 0x1f;
++    if (layers == 0x1c) return true;
++    if (!(layers & 0x10) || reg(0x38) != 0xc00c || reg(0x50) != 0x2021 || (reg(0xb0) & 3)) return false;
++    // The selection cards also use these planes but start at row zero. A circuit
++    // panorama has a nonzero vertical origin at My in rotation parameter A.
++    const uint32_t table = (((uint32_t)reg(0xbc) << 16 | reg(0xbe)) & ~0x41u) * 2;
++    return vw(table + 0x48) != 0;
 +}
 +
 +// Flat title cards and loading illustrations have no off-camera artwork. Extend the
@@ -620,18 +1453,28 @@ index 4c8bcb1..c9de73a 100644
 +    f.w += margin * 2;
      bool dd = (tvmd >> 6 & 3) == 3;              // double-density interlace
      f.h = vdp2_lines() * (dd ? 2 : 1);
-     f.px.assign((size_t)f.w * f.h, 0);
-     if (!(tvmd & 0x8000)) return;                // display off
+-    f.px.assign((size_t)f.w * f.h, 0);
+-    if (!(tvmd & 0x8000)) return;                // display off
++    const int width = f.w, height = f.h;
++    const bool race = rally_course_scene();
++    if (!(tvmd & 0x8000)) { f.px.assign((size_t)width * height, 0); return; }
      note_unsupported();
 -    Nbg nbg[4];
 -    for (int n = 0; n < 4; ++n) setup_nbg(n, nbg[n]);
 +    Nbg nbg[5];
 +    for (int n = 0; n < 5; ++n) setup_nbg(n, nbg[n]);
++    const bool hd = race && nbg[4].on && margin && hreso == 1 && height == 224 &&
++                    !dd && !(vdp1_reg_read(0, 2) & 7) && rally_hd_ready();
++    if (hd) {
++        f.w = rally_hd_width();
++        f.h = f.w == 1920 ? 1080 : 2 * height;
++    }
++    f.px.resize((size_t)f.w * f.h);
 +    RotationMap rot = nbg[4].on ? rotation_map() : RotationMap{};
      uint32_t bk = ((uint32_t)(reg(0xAC) & 7) << 16 | reg(0xAE)) * 2;
      bool bk_lines = reg(0xAC) & 0x8000;
      bool add = reg(0xEC) >> 8 & 1;
-@@ -421,7 +558,7 @@ void vdp2_compose(Frame& f) {
+@@ -421,15 +601,37 @@ void vdp2_compose(Frame& f) {
      line_colour.ratio = (uint8_t)(reg(0x10E) & 0x1F);
      uint16_t sfprmd = reg(0xEA), sfccmd = reg(0xEE);
      uint8_t wctl[L_COUNT] = {(uint8_t)(reg(0xD4) >> 8), (uint8_t)reg(0xD0), (uint8_t)(reg(0xD0) >> 8),
@@ -640,8 +1483,44 @@ index 4c8bcb1..c9de73a 100644
      uint8_t cc_wctl = (uint8_t)(reg(0xD6) >> 8);
      uint16_t sdctl = reg(0xE2);
      // gradation: the screen BOKN names, blurred along the line, as the second image wherever it is the
-@@ -442,7 +579,7 @@ void vdp2_compose(Frame& f) {
-             for (int x = 0; x < f.w; ++x) {
+     // top or second image of a colour calculation
+     static const int kGradLayer[8] = {L_SPRITE, -1, L_NBG0, -1, L_NBG1, L_NBG2, L_NBG3, -1};
+     int grad = reg(0xEC) & 0x8000 && hreso < 2 && cram_mode() == 0 ? kGradLayer[reg(0xEC) >> 12 & 7] : -1;
+-    std::vector<uint32_t> blur(grad >= 0 ? f.w : 0);
+-    for (int y = 0; y < f.h; ++y) {
++    std::vector<uint32_t> blur(grad >= 0 ? width : 0);
++    const bool offset_active[] = {
++        ((reg(0x114) | reg(0x116) | reg(0x118)) & 0x1ff) != 0,
++        ((reg(0x11a) | reg(0x11c) | reg(0x11e)) & 0x1ff) != 0
++    };
++    const uint8_t rgb_priority = reg(0xF0) & 7;
++    const bool plain_rgb = (reg(0xE0) & 0x20) && rgb_priority && !(reg(0xEC) & 0x40) &&
++                           (!(reg(0x110) & 0x40) || !offset_active[(reg(0x112) >> 6) & 1]);
++    const uint16_t sprite_priorities = (uint16_t)(rgb_priority * 0x101);
++    const bool uniform_sprites = hd && plain_rgb && (reg(0xe0) & 0x3f) == 0x20 &&
++        !(reg(0xec) & 0x5f) && (reg(0xf0) & 0x0707) == sprite_priorities &&
++        (reg(0xf2) & 0x0707) == sprite_priorities;  // sprite type 0 uses priority indices 0..3
++    const uint32_t* colors = uniform_sprites ? race_sprite_colors() : nullptr;
++    std::array<int, 471> x_edges;
++    if (hd) {
++        for (int x = 0; x <= width; ++x) x_edges[x] = (x * f.w + width / 2) / width;
++    }
++    for (int y = 0; y < height; ++y) {
++        const int y0 = hd ? (y * f.h + height / 2) / height : y;
++        const int y1 = hd ? ((y + 1) * f.h + height / 2) / height : y + 1;
++        std::array<const uint16_t*, 5> sprite_rows;
++        if (hd) {
++            for (int row = y0; row < y1; ++row) sprite_rows[row - y0] = rally_hd_row(row);
++        }
+         int line = dd ? y >> 1 : y;
+         Win win[2] = {window_line(0, y, dd), window_line(1, y, dd)};
+         back.rgb = rgb555(vw(bk + (bk_lines ? (uint32_t)line * 2 : 0)));
+@@ -439,10 +641,10 @@ void vdp2_compose(Frame& f) {
+             // each dot averaged with the average of the two before it; a dot the screen does not draw is black
+             auto avg = [](uint32_t a, uint32_t b) { return (a + b - ((a ^ b) & 0x010101)) >> 1; };
+             uint32_t prev[2] = {0, 0};
+-            for (int x = 0; x < f.w; ++x) {
++            for (int x = 0; x < width; ++x) {
                  Pix p{};
                  bool drawn = grad == L_SPRITE ? sprite_pixel(sprite_dot(x, y, dd), p) == S_DOT
 -                                              : nbg[grad - L_NBG0].on && nbg_pixel(nbg[grad - L_NBG0], x, y, p);
@@ -649,20 +1528,31 @@ index 4c8bcb1..c9de73a 100644
                  uint32_t here = drawn ? p.rgb : 0;
                  if (x == 0) prev[0] = prev[1] = here;
                  blur[x] = avg(avg(prev[0], prev[1]), here);
-@@ -461,19 +598,37 @@ void vdp2_compose(Frame& f) {
-             // in the order that wins ties: sprite, then NBG0..NBG3
-             l[L_SPRITE] = {};
-             uint8_t shadow = 0;                  // the priority of a shadow dot here
--            if (!windowed(wctl[L_SPRITE], win, x)) {
-+            const int logical_x = x - margin;
-+            if (!windowed(wctl[L_SPRITE], win, logical_x)) {
-                 switch (sprite_pixel(sprite_dot(x, y, dd), l[L_SPRITE])) {
-                 case S_DOT: consider(L_SPRITE); break;
-                 case S_SHADOW: shadow = l[L_SPRITE].prio; l[L_SPRITE] = {}; break;
-                 case S_NONE: break;
-                 }
+@@ -450,7 +652,7 @@ void vdp2_compose(Frame& f) {
+                 prev[1] = here;
              }
+         }
+-        for (int x = 0; x < f.w; ++x) {
++        for (int x = 0; x < width; ++x) {
+             Pix l[L_COUNT];
+             int top = -1, second = -1;
+             auto consider = [&](int i) {
+@@ -458,22 +660,30 @@ void vdp2_compose(Frame& f) {
+                 if (top < 0 || l[i].prio > l[top].prio) { second = top; top = i; }
+                 else if (second < 0 || l[i].prio > l[second].prio) second = i;
+             };
+-            // in the order that wins ties: sprite, then NBG0..NBG3
+-            l[L_SPRITE] = {};
+-            uint8_t shadow = 0;                  // the priority of a shadow dot here
+-            if (!windowed(wctl[L_SPRITE], win, x)) {
+-                switch (sprite_pixel(sprite_dot(x, y, dd), l[L_SPRITE])) {
+-                case S_DOT: consider(L_SPRITE); break;
+-                case S_SHADOW: shadow = l[L_SPRITE].prio; l[L_SPRITE] = {}; break;
+-                case S_NONE: break;
+-                }
+-            }
 -            for (int n = 0; n < 4; ++n) {
++            const int logical_x = x - margin;
 +            for (int n : {4, 0, 1, 2, 3}) {
                  Pix& p = l[L_NBG0 + n];
                  p = {};
@@ -674,8 +1564,8 @@ index 4c8bcb1..c9de73a 100644
 +                    // The menu stores its complete repeating background on a single page;
 +                    // adjacent VRAM holds other graphics. Wrap only that backdrop.
 +                    int sample_x = logical_x;
-+                    if (margin && (reg(0x20) & 0x1f) != 0x1c) {
-+                        const int page_width = f.w - 2 * margin;
++                    if (margin && !race) {
++                        const int page_width = width - 2 * margin;
 +                        if (sample_x < 0) sample_x += page_width;
 +                        else if (sample_x >= page_width) sample_x -= page_width;
 +                    }
@@ -685,23 +1575,102 @@ index 4c8bcb1..c9de73a 100644
 +                    if (!map_pixel(s, (uint32_t)sx, (uint32_t)sy, p)) continue;
 +                } else {
 +                    int hud_x = x - margin;
-+                    if (margin && (hud_x < 0 || hud_x >= f.w - 2 * margin)) continue;
++                    if (margin && (hud_x < 0 || hud_x >= width - 2 * margin)) continue;
 +                    if (!nbg_pixel(s, hud_x, y, p)) continue;
 +                }
                  p.prio = s.prio;
                  if ((sfprmd >> (n * 2) & 3) == 1) p.prio = (uint8_t)((s.prio & 6) | p.spr);
                  if (!p.prio) continue;
-@@ -490,7 +645,7 @@ void vdp2_compose(Frame& f) {
-                   : second >= 0 ? l[second] : back;
-             if (grad >= 0 && (top == grad || second == grad)) u.rgb = blur[x];
-             uint32_t rgb = t.rgb;
+@@ -485,30 +695,78 @@ void vdp2_compose(Frame& f) {
+                 p.ratio = s.ratio; p.offset = s.offset; p.offset_b = s.offset_b;
+                 consider(L_NBG0 + n);
+             }
+-            const Pix& t = top >= 0 ? l[top] : back;
+-            Pix u = top >= 0 && (lnclen >> (top == L_SPRITE ? 5 : top - L_NBG0) & 1) && grad < 0 ? line_colour
+-                  : second >= 0 ? l[second] : back;
+-            if (grad >= 0 && (top == grad || second == grad)) u.rgb = blur[x];
+-            uint32_t rgb = t.rgb;
 -            if (top >= 0 && t.cc && !windowed(cc_wctl, win, x)) {
-+            if (top >= 0 && t.cc && !windowed(cc_wctl, win, logical_x)) {
-                 uint32_t out = 0;
-                 int ratio = second_ratio ? u.ratio : t.ratio;
-                 for (int sh = 16; sh >= 0; sh -= 8) {
-@@ -509,6 +664,10 @@ void vdp2_compose(Frame& f) {
-             f.px[(size_t)y * f.w + x] = rgb;
+-                uint32_t out = 0;
+-                int ratio = second_ratio ? u.ratio : t.ratio;
+-                for (int sh = 16; sh >= 0; sh -= 8) {
+-                    int a = (int)(t.rgb >> sh & 0xFF), b = (int)(u.rgb >> sh & 0xFF);
+-                    // ratio 0 is 31:1, not 32:0: the second image always shows through a little
+-                    int c = add ? std::min(a + b, 255) : (a * (31 - ratio) + b * (ratio + 1)) >> 5;
+-                    out |= (uint32_t)c << sh;
++            // The tile/HUD layers and their window masks are native dots. Reuse this
++            // stack for all four VDP1 samples, including any shadows or blend effects.
++            const bool sprites = !windowed(wctl[L_SPRITE], win, logical_x);
++            const int bg_top = top, bg_second = second;
++            const uint8_t bg_priority = bg_top >= 0 ? l[bg_top].prio : 0;
++            auto compose_sample = [&](uint16_t raw) -> uint32_t {
++                if (sprites && plain_rgb && (raw & 0x8000) && rgb_priority >= bg_priority)
++                    return rgb555(raw);
++                int top = bg_top, second = bg_second;
++                uint8_t shadow = 0;
++                if (sprites && raw) {
++                    Pix& sprite = l[L_SPRITE];
++                    sprite = {};
++                    SpriteDot kind = sprite_pixel(raw, sprite);
++                    if (kind == S_DOT) {
++                        // The sprite wins ties against all scroll screens.
++                        if (sprite.prio >= bg_priority) { second = top; top = L_SPRITE; }
++                        else if (second < 0 || sprite.prio >= l[second].prio) second = L_SPRITE;
++                    } else if (kind == S_SHADOW) shadow = sprite.prio;
++                }
++                const Pix& t = top >= 0 ? l[top] : back;
++                Pix u = top >= 0 && (lnclen >> (top == L_SPRITE ? 5 : top - L_NBG0) & 1) && grad < 0 ? line_colour
++                      : second >= 0 ? l[second] : back;
++                if (grad >= 0 && (top == grad || second == grad)) u.rgb = blur[x];
++                uint32_t rgb = t.rgb;
++                if (top >= 0 && t.cc && !windowed(cc_wctl, win, logical_x)) {
++                    uint32_t out = 0;
++                    int ratio = second_ratio ? u.ratio : t.ratio;
++                    for (int sh = 16; sh >= 0; sh -= 8) {
++                        int a = (int)(t.rgb >> sh & 0xFF), b = (int)(u.rgb >> sh & 0xFF);
++                        // ratio 0 is 31:1, not 32:0: the second image always shows through a little
++                        int c = add ? std::min(a + b, 255) : (a * (31 - ratio) + b * (ratio + 1)) >> 5;
++                        out |= (uint32_t)c << sh;
++                    }
++                    rgb = out;
+                 }
+-                rgb = out;
++                if (t.offset && offset_active[t.offset_b]) rgb = apply_offset(rgb, t.offset_b);
++                // A shadow halves the top screen under it when SDCTL enables that screen (bit 5: the back screen).
++                bool shaded = top == L_SPRITE ? t.shade
++                            : shadow && shadow >= t.prio && (sdctl >> (top >= 0 ? top - L_NBG0 : 5) & 1);
++                if (shaded) rgb = rgb >> 1 & 0x7F7F7F;
++                return rgb;
++            };
++            if (hd) {
++                const int x0 = x_edges[x], span = x_edges[x + 1] - x0;
++                const uint32_t background = compose_sample(0);
++                const uint32_t shadow = (sdctl >> (bg_top >= 0 ? bg_top - L_NBG0 : 5) & 1)
++                                      ? (background >> 1 & 0x7f7f7f) : background;
++                for (int row = y0; row < y1; ++row) {
++                    uint32_t* dst = &f.px[(size_t)row * f.w + x0];
++                    const uint16_t* src = sprite_rows[row - y0] + x0;
++                    if (!sprites || (colors && rgb_priority < bg_priority)) {
++                        std::fill_n(dst, span, background);
++                    } else if (colors) {
++                        for (int j = 0; j < span; ++j) {
++                            const uint32_t color = colors[src[j]];
++                            dst[j] = color < transparent_dot ? color : color == shadow_dot ? shadow : background;
++                        }
++                    } else {
++                        for (int j = 0; j < span; ++j)
++                            dst[j] = j && src[j] == src[j - 1] ? dst[j - 1] : compose_sample(src[j]);
++                    }
++                }
++            } else {
++                f.px[(size_t)y * f.w + x] = compose_sample(sprite_dot(x, y, dd));
+             }
+-            if (t.offset) rgb = apply_offset(rgb, t.offset_b);
+-            // A shadow halves the top screen under it when SDCTL enables that screen (bit 5: the back screen).
+-            bool shaded = top == L_SPRITE ? t.shade
+-                        : shadow && shadow >= t.prio && (sdctl >> (top >= 0 ? top - L_NBG0 : 5) & 1);
+-            if (shaded) rgb = rgb >> 1 & 0x7F7F7F;
+-            f.px[(size_t)y * f.w + x] = rgb;
          }
      }
 +    if (margin && !nbg[4].on) {
@@ -712,10 +1681,10 @@ index 4c8bcb1..c9de73a 100644
  
  void vdp2_state(State& s) { s(g_vdp2_vram), s(g_vdp2_cram), s(g_vdp2_regs); }
 diff --git a/runtime/src/video/video.cpp b/runtime/src/video/video.cpp
-index 76c91da..f50e02c 100644
+index 76c91da..9f3dbe5 100644
 --- a/runtime/src/video/video.cpp
 +++ b/runtime/src/video/video.cpp
-@@ -71,6 +71,36 @@ static void dump(const char* prefix, uint64_t n) {
+@@ -71,6 +71,67 @@ static void dump(const char* prefix, uint64_t n) {
      std::fclose(f);
  }
  
@@ -728,31 +1697,62 @@ index 76c91da..f50e02c 100644
 +// race frames, interpolate the final colours so the depth order and coverage of
 +// the car, road and scenery always come from the game's own renderer.
 +static void compose_rally_field() {
-+    static Frame previous, current;
-+    static uint64_t last_change, previous_field;
++    static Frame native, scratch;
++    static uint64_t last_change, previous_field, display_revision;
++    static uint32_t sprite_mode;
++    static bool presented_native, can_reuse;
++    static uint8_t vram[sizeof(g_vdp2_vram)], cram[sizeof(g_vdp2_cram)], regs[sizeof(g_vdp2_regs)];
 +    const uint64_t change = vdp1_frame_changes();
++    const uint32_t mode = vdp1_reg_read(0, 2) << 16 | vdp1_reg_read(2, 2);
 +    const bool consecutive = previous_field + 1 == g_vblanks;
 +    previous_field = g_vblanks;
-+    vdp2_compose(current);
-+    const bool racing = (reg16(g_vdp2_regs, 0x20) & 0x1f) == 0x1c;
-+    if (consecutive && racing && current.widescreen && current.w == previous.w &&
-+        current.h == previous.h && previous.widescreen && change == last_change + 1) {
-+        g_frame = current;
-+        for (size_t i = 0; i < current.px.size(); ++i) {
-+            uint32_t a = previous.px[i], b = current.px[i];
++    // A blended field is followed by the unblended version of the same scene.
++    // Only reuse it if the framebuffer, background, palette, and display controls
++    // still match. TVSTAT and beam coordinates (bytes 4..11) advance independently.
++    if (consecutive && can_reuse && change == last_change && mode == sprite_mode &&
++        display_revision == vdp1_display_revision() &&
++        !std::memcmp(regs, g_vdp2_regs, 4) &&
++        !std::memcmp(regs + 12, g_vdp2_regs + 12, sizeof(regs) - 12) &&
++        !std::memcmp(cram, g_vdp2_cram, sizeof(cram)) &&
++        !std::memcmp(vram, g_vdp2_vram, sizeof(vram))) {
++        std::swap(g_frame, native);
++        presented_native = true;
++        can_reuse = false;
++        return;
++    }
++    if (presented_native) std::swap(g_frame, native);
++    vdp2_compose(scratch);
++    const bool blend = consecutive && rally_course_scene() && scratch.widescreen && native.widescreen &&
++                       scratch.w == native.w && scratch.h == native.h && change == last_change + 1;
++    can_reuse = blend && scratch.w >= 1920;
++    if (can_reuse) {
++        display_revision = vdp1_display_revision();
++        sprite_mode = mode;
++        std::memcpy(vram, g_vdp2_vram, sizeof(vram));
++        std::memcpy(cram, g_vdp2_cram, sizeof(cram));
++        std::memcpy(regs, g_vdp2_regs, sizeof(regs));
++    }
++    if (blend) {
++        g_frame.widescreen = scratch.widescreen;
++        g_frame.w = scratch.w;
++        g_frame.h = scratch.h;
++        g_frame.px.resize(scratch.px.size());
++        for (size_t i = 0; i < scratch.px.size(); ++i) {
++            uint32_t a = native.px[i], b = scratch.px[i];
 +            g_frame.px[i] = (a & b) + (((a ^ b) & 0xFEFEFEu) >> 1);
 +        }
++        std::swap(native, scratch);
 +    } else {
-+        g_frame = current;
++        std::swap(g_frame, scratch);
 +    }
-+    std::swap(previous, current);
++    presented_native = !blend;
 +    last_change = change;
 +}
 +
  static void vblank_in(uint64_t now) {
      ++g_vblanks;
      achievements_frame();
-@@ -78,7 +108,7 @@ static void vblank_in(uint64_t now) {
+@@ -78,7 +139,7 @@ static void vblank_in(uint64_t now) {
      if (listed(g_cfg.dump, n)) dump("", g_vblanks);
      bool shot = listed(g_cfg.shots, n);
      bool compose = shot || host_wants_frame() || movie_on();
@@ -761,7 +1761,7 @@ index 76c91da..f50e02c 100644
          uint8_t saved[0x30];
          std::copy(g_vdp2_regs + 0x70, g_vdp2_regs + 0xA0, saved);
          vdp1_interp_scroll(g_vdp2_regs + 0x70);
-@@ -88,7 +118,8 @@ static void vblank_in(uint64_t now) {
+@@ -88,7 +149,8 @@ static void vblank_in(uint64_t now) {
          movie_frame(g_frame);
          host_present(g_frame);
      } else if (compose) {
@@ -772,14 +1772,27 @@ index 76c91da..f50e02c 100644
          movie_frame(g_frame);
          host_present(g_frame);
 diff --git a/runtime/src/video/video.h b/runtime/src/video/video.h
-index ebaa466..131c18b 100644
+index ebaa466..63aab8a 100644
 --- a/runtime/src/video/video.h
 +++ b/runtime/src/video/video.h
-@@ -26,7 +26,11 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
+@@ -17,7 +17,11 @@ void vdp1_fb_write(uint32_t off, uint32_t v, int size);
+ void vdp1_vblank_out();                              // erase, frame change, the draw PTMR 2 asks for
+ void vdp1_tick(uint64_t now);                        // the end of a draw
+ uint16_t vdp1_dot(int x, int y, bool dd);           // the sprite dot VDP2 shows at x, line y (dd: double-density, 2 lines a framebuffer line)
++bool rally_hd_ready();                                // high-resolution copy of the displayed race framebuffer is ready
++int rally_hd_width();                                 // visible width of the displayed race framebuffer
++const uint16_t* rally_hd_row(int y);                  // first visible 16-bit sample on an output line
+ uint64_t vdp1_frame_changes();
++uint64_t vdp1_display_revision();
+ uint64_t vdp1_draws();
+ void vdp1_dump(FILE* f);                             // VRAM, the draw framebuffer, the registers
+ bool vdp1_interp_field(bool compose);                // --interp: a frame in between for this field?
+@@ -26,7 +30,12 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
  
  // ---- VDP2 (vdp2.cpp) --------------------------------------------------------------------
  extern uint8_t g_vdp2_vram[0x80000], g_vdp2_cram[0x1000], g_vdp2_regs[0x200];
 +int rally_wide_margin();
++bool rally_course_scene();
 +bool rally_frame_interpolation();
 +
  struct Frame {
@@ -787,3 +1800,38 @@ index ebaa466..131c18b 100644
      int w = 0, h = 0;
      std::vector<uint32_t> px;                       // 0x00RRGGBB, w*h, top row first
  };
+diff --git a/runtime/tests/bup_test.cpp b/runtime/tests/bup_test.cpp
+index da7b0dc..59128f9 100644
+--- a/runtime/tests/bup_test.cpp
++++ b/runtime/tests/bup_test.cpp
+@@ -181,6 +181,30 @@ TEST(a_damaged_file_keeps_the_saves_before_the_damage) {
+     CHECK_EQ(read_back("LATER", 4000, 2), 5);
+ }
+ 
++TEST(a_truncated_card_recovers_the_previous_revision) {
++    fs::path file = scratch() / "backup.bin";
++    run(file.string());
++    CHECK_EQ(write("RECORD", 40, 7), 0);
++    CHECK_EQ(write("RECORD", 40, 8), 0);
++    fs::resize_file(file, 12);
++    run(file.string());
++    CHECK_EQ(read_back("RECORD", 40, 7), 0);
++    bios_save();
++    run(file.string());
++    CHECK_EQ(read_back("RECORD", 40, 7), 0);
++}
++
++TEST(a_failed_write_stays_pending_for_retry) {
++    fs::path file = scratch() / "backup.bin";
++    run(file.string());
++    fs::create_directories(file.string() + ".new");
++    CHECK_EQ(write("RECORD", 40, 7), 8);
++    fs::remove(file.string() + ".new");
++    bios_save();
++    run(file.string());
++    CHECK_EQ(read_back("RECORD", 40, 7), 0);
++}
++
+ TEST(a_write_over_a_save_needs_r7_zero) {
+     fs::path file = scratch() / "backup.bin";
+     run(file.string());
