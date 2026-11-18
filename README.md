@@ -1,4 +1,4 @@
-# Sega Rally Plus NetLink para Linux — v0.1.2
+# Sega Rally Plus NetLink para Linux — v0.1.3
 
 Recompilação local da edição americana de **Sega Rally Championship Plus NetLink Edition** para Linux x86-64, a partir do disco fornecido pelo jogador. O jogo inicia no modo offline e usa SDL3 para vídeo, áudio e controles.
 
@@ -46,6 +46,8 @@ No Steam, escolha `play.sh` como destino e deixe desativada a opção de forçar
 | X | Alternar câmera |
 | RB | Botão C do Saturn, indicado para confirmar nos menus |
 | Menu | Start |
+
+O controle do jogador 1 recebe uma vibração leve enquanto o carro está em movimento. A intensidade acompanha o velocímetro, com um pulso mais forte quando a velocidade cai bruscamente. Parar o carro ou abrir a pausa interrompe a vibração. O efeito usa o suporte de rumble do gamepad via SDL3.
 
 ## Progresso automático
 

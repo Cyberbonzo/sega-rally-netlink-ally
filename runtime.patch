@@ -25,10 +25,62 @@ index cb6af72..25d02ed 100644
  }
  
 diff --git a/runtime/src/host/host.cpp b/runtime/src/host/host.cpp
-index f6f1f3d..f6b661b 100644
+index f6f1f3d..b83e1d0 100644
 --- a/runtime/src/host/host.cpp
 +++ b/runtime/src/host/host.cpp
-@@ -1113,8 +1113,9 @@ static void present(const Frame& f) {
+@@ -1072,8 +1072,41 @@ static void draw() {
+     SDL_RenderPresent(g_ren);
+ }
+ 
++// Refresh short motor commands so losing focus or leaving the race cannot
++// leave a motor running. Only the gamepad assigned to the driver receives them.
++static void rally_rumble(int speed) {
++    static int last_speed;
++    static Uint64 next;
++    static bool reported;
++    if (speed <= 3 && !last_speed) return;
++    Uint64 now = SDL_GetTicks();
++    if (speed > 3 && now < next) return;
++    unsigned low = 0, high = 0;
++    if (speed > 3) {
++        int drop = last_speed - speed;
++        low = 3800 + 22 * std::min(speed, 220);
++        high = 1600 + 12 * std::min(speed, 220);
++        if (drop >= 8) {
++            low += 4200;
++            high += 3200;
++        }
++    }
++    last_speed = low ? speed : 0;
++    next = now + 80;
++    for (const auto& p : g_pads) {
++        if (g_slots.slot_of(p.id) != 0) continue;
++        bool ok = SDL_RumbleGamepad(p.pad, low, high, low ? 130 : 0);
++        if (!reported && low) {
++            sat_note("race rumble: player 1, %d km/h, motors %u/%u, %s",
++                     speed, low, high, ok ? "accepted" : SDL_GetError());
++            reported = true;
++        }
++    }
++}
++
+ // The menu, open until it is closed; the game waits.
+ static void menu_loop() {
++    rally_rumble(0);
+     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
+     ++g_host_paused;
+     Clock::time_point t = Clock::now();
+@@ -1095,6 +1128,9 @@ static void menu_loop() {
+ 
+ static void present(const Frame& f) {
+     g_last = &f;
++    const auto flags = SDL_GetWindowFlags(g_win);
++    bool playing = (flags & SDL_WINDOW_INPUT_FOCUS) && !(flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED | SDL_WINDOW_HIDDEN));
++    rally_rumble(playing && !g_menu_open && !sat_resuming() ? rally_rumble_speed() : 0);
+     if (SDL_GetWindowFlags(g_win) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED | SDL_WINDOW_HIDDEN)) {
+         events();
+         if (g_menu_open) menu_loop();
+@@ -1113,8 +1149,9 @@ static void present(const Frame& f) {
      SDL_GetCurrentRenderOutputSize(g_ren, &ww, &wh);
      // the TV's 4:3 screen, as large as the window allows, centred; a PAL TV
      // shows 256 lines, and a 224-line picture has a border above and below
@@ -1681,10 +1733,31 @@ index 4c8bcb1..cf4fef1 100644
  
  void vdp2_state(State& s) { s(g_vdp2_vram), s(g_vdp2_cram), s(g_vdp2_regs); }
 diff --git a/runtime/src/video/video.cpp b/runtime/src/video/video.cpp
-index 76c91da..9f3dbe5 100644
+index 76c91da..b6dcf5f 100644
 --- a/runtime/src/video/video.cpp
 +++ b/runtime/src/video/video.cpp
-@@ -71,6 +71,67 @@ static void dump(const char* prefix, uint64_t n) {
+@@ -31,6 +31,20 @@ static uint64_t g_line_abs;                      // raster lines since power-on
+ static uint64_t g_vblanks;
+ static Frame g_frame;
+ 
++// Take feedback from the player's speedometer while the race HUD is updating.
++static uint64_t g_speed_field;
++static unsigned g_speed_kmh;
++
++void rally_speedometer(unsigned kmh) {
++    g_speed_field = g_vblanks;
++    g_speed_kmh = kmh;
++}
++
++int rally_rumble_speed() {
++    if (!g_speed_field || g_vblanks - g_speed_field > 4 || (g_vdp2_regs[0x21] & 31) != 0x1c) return 0;
++    return g_speed_kmh <= 400 ? int(g_speed_kmh) : 0;
++}
++
+ uint64_t sat_vblanks() { return g_vblanks; }
+ uint64_t video_frame_changes() { return vdp1_frame_changes(); }
+ uint64_t video_frame_ns() { return kLineNs * kLines; }
+@@ -71,6 +85,67 @@ static void dump(const char* prefix, uint64_t n) {
      std::fclose(f);
  }
  
@@ -1752,7 +1825,7 @@ index 76c91da..9f3dbe5 100644
  static void vblank_in(uint64_t now) {
      ++g_vblanks;
      achievements_frame();
-@@ -78,7 +139,7 @@ static void vblank_in(uint64_t now) {
+@@ -78,7 +153,7 @@ static void vblank_in(uint64_t now) {
      if (listed(g_cfg.dump, n)) dump("", g_vblanks);
      bool shot = listed(g_cfg.shots, n);
      bool compose = shot || host_wants_frame() || movie_on();
@@ -1761,7 +1834,7 @@ index 76c91da..9f3dbe5 100644
          uint8_t saved[0x30];
          std::copy(g_vdp2_regs + 0x70, g_vdp2_regs + 0xA0, saved);
          vdp1_interp_scroll(g_vdp2_regs + 0x70);
-@@ -88,7 +149,8 @@ static void vblank_in(uint64_t now) {
+@@ -88,7 +163,8 @@ static void vblank_in(uint64_t now) {
          movie_frame(g_frame);
          host_present(g_frame);
      } else if (compose) {
@@ -1772,7 +1845,7 @@ index 76c91da..9f3dbe5 100644
          movie_frame(g_frame);
          host_present(g_frame);
 diff --git a/runtime/src/video/video.h b/runtime/src/video/video.h
-index ebaa466..63aab8a 100644
+index ebaa466..52db9ec 100644
 --- a/runtime/src/video/video.h
 +++ b/runtime/src/video/video.h
 @@ -17,7 +17,11 @@ void vdp1_fb_write(uint32_t off, uint32_t v, int size);
@@ -1787,12 +1860,13 @@ index ebaa466..63aab8a 100644
  uint64_t vdp1_draws();
  void vdp1_dump(FILE* f);                             // VRAM, the draw framebuffer, the registers
  bool vdp1_interp_field(bool compose);                // --interp: a frame in between for this field?
-@@ -26,7 +30,12 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
+@@ -26,7 +30,13 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
  
  // ---- VDP2 (vdp2.cpp) --------------------------------------------------------------------
  extern uint8_t g_vdp2_vram[0x80000], g_vdp2_cram[0x1000], g_vdp2_regs[0x200];
 +int rally_wide_margin();
 +bool rally_course_scene();
++int rally_rumble_speed();
 +bool rally_frame_interpolation();
 +
  struct Frame {

@@ -67,6 +67,21 @@ def select_metric_units(output):
         raise ValueError(f"Missing speedometer branches: {sorted(decisions - found)}")
 
 
+def report_race_speed(output):
+    # The HUD has just converted the player's speed into integer km/h (MACH).
+    marker = "    c.r[4] = 0x2090u;  // 06017654 "
+    found = 0
+    for path in output.glob("p_rally_*.cpp"):
+        source = path.read_text(encoding="utf-8")
+        if marker in source:
+            found += source.count(marker)
+            if "::rally_speedometer(c.mach);" not in source:
+                source = source.replace(marker, "    ::rally_speedometer(c.mach);\n" + marker)
+                path.write_text("void rally_speedometer(unsigned);\n" + source, encoding="utf-8")
+    if not found:
+        raise ValueError("Missing player speedometer")
+
+
 def widen_projection_clip(output):
     # The master and slave render contexts share this bind routine. The packed
     # 176x112 half-extents feed both vertex rejection and quad clipping.
@@ -179,6 +194,7 @@ def adapt_generated_sources(output):
     widen_projection_clip(output)
     extend_stage_clock(output)
     select_metric_units(output)
+    report_race_speed(output)
     decoded = False
     omitted = set()
     for path in sorted(output.glob("p_rally_*.cpp")):
