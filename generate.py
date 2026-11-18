@@ -48,7 +48,83 @@ def adapt_decoder(text):
     return replace_one(text, exit_line, updated)
 
 
+def select_metric_units(output):
+    # Boot keeps the US language/region. These five HUD decisions select the
+    # stock metric art, tile layout and speed multiplier.
+    decisions = {"06009474", "06016D2E", "06016D60", "06016DC6", "0601764A"}
+    found = set()
+    for path in output.glob("p_rally_*.cpp"):
+        source = original = path.read_text(encoding="utf-8")
+        for pc in decisions:
+            metric = f"c.t = true;  // {pc} "
+            region = f"c.t = (c.r[0] & 0x1u) == 0;  // {pc} "
+            if region in source or metric in source:
+                source = source.replace(region, metric)
+                found.add(pc)
+        if source != original:
+            path.write_text(source, encoding="utf-8")
+    if found != decisions:
+        raise ValueError(f"Missing speedometer branches: {sorted(decisions - found)}")
+
+
+def widen_projection_clip(output):
+    # The master and slave render contexts share this bind routine. The packed
+    # 176x112 half-extents feed both vertex rejection and quad clipping.
+    needle = "    { const uint32_t x = c.pr; c.gbr = c.r[14]; c.pc = x; return; }  // 0601F7D8 "
+    local = """    static const bool wide_race_enabled = std::getenv("SR_NETLINK_WIDE") != nullptr;
+    if (wide_race_enabled) {
+        const uint32_t bounds_address = c.r[14] + 24;
+        const uint32_t bounds = ld32(bounds_address);
+        if (bounds == 0x00B00070u || bounds == 0x00EB0070u) {
+            // The game's BGON shadow identifies the active driving layers.
+            const bool racing = (ld16(0x060AA8E6u) & 0x1Fu) == 0x1Cu;
+            const uint32_t wanted = racing ? 0x00EB0070u : 0x00B00070u;
+            if (bounds != wanted) st32(bounds_address, wanted);
+        }
+    }
+"""
+    found = 0
+    for path in output.glob("p_rally_*.cpp"):
+        source = path.read_text(encoding="utf-8")
+        if needle not in source:
+            continue
+        found += source.count(needle)
+        if local not in source:
+            source = "#include <cstdlib>\n" + source.replace(needle, local + needle)
+            path.write_text(source, encoding="utf-8")
+    if found != 1:
+        raise ValueError("Expected one graphics context bind in the US NetLink program")
+
+
+def extend_stage_clock(output):
+    # Championship (first stage and carry-over) and Practice call the allowance
+    # routine at stage setup. Checkpoints call it separately. The timer stores
+    # binary seconds above a byte holding the sub-second tick.
+    starts = {"06019E5E", "06019E82", "06019EB0"}
+    bonus = "    st32(c.r[13] + 52, ld32(c.r[13] + 52) + (10u << 8));"
+    seen = set()
+    for path in output.glob("p_rally_*.cpp"):
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines(keepends=True)
+        patched = []
+        for line in lines:
+            match = re.search(r"// ([0-9A-F]{8}) bra 0x0601A8A8 ; mov #0,r3", line)
+            if match and match[1] in starts:
+                seen.add(match[1])
+                if not patched or patched[-1].strip() != bonus.strip():
+                    patched.append(bonus + "\n")
+            patched.append(line)
+        updated = "".join(patched)
+        if updated != source:
+            path.write_text(updated, encoding="utf-8")
+    if seen != starts:
+        raise ValueError("Missing timed-stage initializer in the US NetLink program")
+
+
 def adapt_generated_sources(output):
+    widen_projection_clip(output)
+    extend_stage_clock(output)
+    select_metric_units(output)
     decoded = False
     omitted = set()
     for path in sorted(output.glob("p_rally_*.cpp")):

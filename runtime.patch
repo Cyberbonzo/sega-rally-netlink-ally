@@ -103,7 +103,7 @@ index d5a3049..c3a8d42 100644
  
  // Mednafen's file-system read: when `find_root`, a seek to the volume descriptor at FAD 166 and that
 diff --git a/runtime/src/machine/onchip.cpp b/runtime/src/machine/onchip.cpp
-index 7cb090a..54b152f 100644
+index 7cb090a..f67d1b3 100644
 --- a/runtime/src/machine/onchip.cpp
 +++ b/runtime/src/machine/onchip.cpp
 @@ -163,7 +163,7 @@ static void divide(OnChip& o, bool wide) {
@@ -125,11 +125,33 @@ index 7cb090a..54b152f 100644
      // the unit's registers are mirrored at +0x20
      for (uint32_t k = 0x100; k < 0x120; k += 4) wr(o, k + 0x20, rd(o, k, 4), 4);
  }
+@@ -218,6 +221,13 @@ uint32_t onchip_read(SH2Context& c, uint32_t a, int size) {
+     }
+     if (off == 0x81 && size == 1) return (uint8_t)wdt_count(o);   // WTCNT
+     uint32_t v = rd(o, off, size);
++    // BCR1.MASTER reports the bus-mode pin, including after a write to BCR1.
++    // Bit 15 of the word at FFFFFFE2 also lies inside a longword at FFFFFFE0.
++    constexpr uint32_t mode_byte = 0x1E2;
++    if (off <= mode_byte && mode_byte < off + size) {
++        uint32_t mask = 0x80u << (8 * (off + size - 1 - mode_byte));
++        v = (v & ~mask) | (c.cpu == 1 ? mask : 0);
++    }
+     if (off == 0x11 && size == 1) {         // FTCSR: a slave waiting here has nothing to do
+         slave_idle_check(v);
+         v = rd(o, off, size);
 diff --git a/runtime/src/video/vdp1.cpp b/runtime/src/video/vdp1.cpp
-index 3562018..bb04271 100644
+index 3562018..0f470c5 100644
 --- a/runtime/src/video/vdp1.cpp
 +++ b/runtime/src/video/vdp1.cpp
-@@ -225,13 +225,17 @@ static void command(const uint8_t* cmd, uint32_t a) {
+@@ -209,6 +209,7 @@ static uint32_t g_dta;                          // a part of a cycle not yet cha
+ // vdp1_raster_gpl.inc's, which follow Mednafen's and are under its licence, the GPL.
+ #if SATURN_VDP1_GPL
+ #include "vdp1_raster_gpl.inc"
++static void begin_tile_filter() {}
+ #else
+ #include "vdp1_raster.inc"
+ #endif
+@@ -225,13 +226,17 @@ static void command(const uint8_t* cmd, uint32_t a) {
      int comm = c.ctrl & 0xF;
      Pt p[4];
      for (int i = 0; i < 4; ++i) p[i] = {sx13(cw(cmd, 12 + i * 4)), sx13(cw(cmd, 14 + i * 4))};
@@ -140,7 +162,7 @@ index 3562018..bb04271 100644
 -        g_ux1 = cw(cmd, 20) & 0x3FF; g_uy1 = cw(cmd, 22) & 0x1FF;
 +        g_ux1 = cw(cmd, 20) & 0x3FF;
 +        if (g_ux0 != 0) g_ux0 += margin;
-+        g_ux1 += g_ux1 == 351 ? 2 * margin : margin;
++        g_ux1 += g_ux1 == 351 || g_ux1 == 319 ? 2 * margin : margin;
 +        g_uy1 = cw(cmd, 22) & 0x1FF;
          return;
      case 0x9:                                   // system clipping
@@ -149,7 +171,7 @@ index 3562018..bb04271 100644
          return;
      case 0xA:                                   // local coordinates
          g_local_x = sx11(cw(cmd, 12)); g_local_y = sx11(cw(cmd, 14));
-@@ -257,7 +261,7 @@ static void command(const uint8_t* cmd, uint32_t a) {
+@@ -257,7 +262,7 @@ static void command(const uint8_t* cmd, uint32_t a) {
          uint32_t ga = (uint32_t)cw(cmd, 28) * 8;
          for (int i = 0; i < 4; ++i) c.g[i] = rgb_of(tw(ga + i * 2));
      }
@@ -158,16 +180,159 @@ index 3562018..bb04271 100644
      draw_shape(c, cmd, comm, p);
  }
  
-@@ -612,6 +616,7 @@ void vdp1_tick(uint64_t now) {
+@@ -324,13 +329,14 @@ static void draw() {
+     g_hi_target = g_hi_on[g_draw_fb] ? g_hi[g_draw_fb] : nullptr;
+     g_dil = g_reg[FBCR] >> 2 & 1;
+     RecDraw* rec = nullptr;
+-    if (g_cfg.interp) {
++    if (g_cfg.interp && !rally_frame_interpolation()) {
+         g_rec_cur.draws.push_back({g_sys_x, g_sys_y, g_ux0, g_uy0, g_ux1, g_uy1, g_local_x, g_local_y, {}});
+         rec = &g_rec_cur.draws.back();
+     }
+     uint32_t a = 0, ret = 0, last = 0;
+     int n = 0;
+     g_draw_steps = 0;
++    begin_tile_filter();
+     g_draw_cycles = 0;
+     g_dta = 0;
+     for (int guard = 0; guard < 20000; ++guard) {
+@@ -395,6 +401,7 @@ static void draw_between(float alpha) {
+     int sx = g_sys_x, sy = g_sys_y, u0 = g_ux0, v0 = g_uy0, u1 = g_ux1, v1 = g_uy1, lx = g_local_x, ly = g_local_y;
+     g_target = g_ifb;
+     g_tex = L.vram.data();
++    begin_tile_filter();
+     int x0 = (L.ewlr >> 9 & 0x7F) * 8, y0 = L.ewlr & 0x1FF, x1 = (L.ewrr >> 9 & 0x7F) * 8, y1 = L.ewrr & 0x1FF;
+     std::fill(g_ifb, g_ifb + 512 * 256, 0);
+     for (int y = y0; y <= y1 && y < 256; ++y)
+@@ -612,6 +619,7 @@ void vdp1_tick(uint64_t now) {
  static void erase(int which) {
      int x0 = (g_reg[EWLR] >> 9 & 0x7F) * 8, y0 = g_reg[EWLR] & 0x1FF;
      int x1 = (g_reg[EWRR] >> 9 & 0x7F) * 8, y1 = g_reg[EWRR] & 0x1FF;
-+    if (x0 == 0 && x1 >= 352) x1 = std::min(512, x1 + 2 * rally_wide_margin());
++    if (x0 == 0 && x1 >= 320) x1 = std::min(512, x1 + 2 * rally_wide_margin());
      for (int y = y0; y <= y1 && y < 256; ++y)
          for (int x = x0; x < x1 && x < 512; ++x) g_fb[which][y * 512 + x] = g_reg[EWDR];
      if (!g_hi_on[which]) return;
+@@ -631,7 +639,7 @@ void vdp1_vblank_out() {
+         g_change_pending = false;
+         g_draw_fb ^= 1;
+         ++g_frame_changes;
+-        if (g_cfg.interp) {
++        if (g_cfg.interp && !rally_frame_interpolation()) {
+             g_rec_prev = std::move(g_rec_last);
+             g_rec_last = std::move(g_rec_cur);
+             g_rec_cur = RecFrame{};
+diff --git a/runtime/src/video/vdp1_raster.inc b/runtime/src/video/vdp1_raster.inc
+index c0a8983..c6597b2 100644
+--- a/runtime/src/video/vdp1_raster.inc
++++ b/runtime/src/video/vdp1_raster.inc
+@@ -24,7 +24,63 @@
+ 
+ static bool outside_clip(const Cmd& c, int x0, int y0, int x1, int y1);
+ 
+-static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1) {
++// A single race draw can repeat the same small tile hundreds of times. Build the
++// summed-area table once per texture/palette pair. Discard it at the next draw,
++// since the game can upload different texels or colours to the same VRAM address.
++using TileSums = std::vector<Rgb>;
++static std::unordered_map<uint64_t, TileSums> g_tile_sums;
++static bool g_filter_race_tiles;
++
++static void begin_tile_filter() {
++    static const bool rally = std::getenv("SR_NETLINK_RACE_BOOT") != nullptr;
++    g_filter_race_tiles = rally && (g_wram_h[0xAA8E7] & 0x1F) == 0x1C;
++    g_tile_sums.clear();
++}
++
++static const TileSums* opaque_tile(const Cmd& c) {
++    const uint64_t key = (uint64_t)c.srca << 40 | (uint64_t)c.colr << 24 |
++                         (uint64_t)c.w << 8 | (unsigned)c.h;
++    auto [it, fresh] = g_tile_sums.try_emplace(key);
++    auto& sums = it->second;
++    if (fresh) {
++        const int stride = c.w + 1;
++        sums.resize(stride * (c.h + 1));
++        for (int y = 0; y < c.h; ++y) {
++            Rgb row{};
++            for (int x = 0; x < c.w; ++x) {
++                const int i = y * c.w + x;
++                uint8_t pair = g_tex[(c.srca + i / 2) & 0x7FFFF];
++                unsigned index = (i & 1) ? pair & 15 : pair >> 4;
++                uint16_t pixel = c.lut[index];
++                if (!index || !(pixel & 0x8000)) {
++                    sums.clear();
++                    return nullptr;
++                }
++                Rgb rgb = rgb_of(pixel);
++                row.r += rgb.r; row.g += rgb.g; row.b += rgb.b;
++                int pos = (y + 1) * stride + x + 1;
++                const Rgb& above = sums[pos - stride];
++                sums[pos] = {row.r + above.r, row.g + above.g, row.b + above.b};
++            }
++        }
++    }
++    return sums.empty() ? nullptr : &sums;
++}
++
++static uint16_t mean_texel(const Cmd& c, const TileSums& sums, int u, int v, int u1, int v1) {
++    if (c.hflip) { int first = c.w - u1; u1 = c.w - u; u = first; }
++    if (c.vflip) { int first = c.h - v1; v1 = c.h - v; v = first; }
++    const int stride = c.w + 1, count = (u1 - u) * (v1 - v);
++    const Rgb &a = sums[v * stride + u], &b = sums[v * stride + u1],
++              &d = sums[v1 * stride + u], &e = sums[v1 * stride + u1];
++    int r = (e.r - b.r - d.r + a.r + count / 2) / count;
++    int g = (e.g - b.g - d.g + a.g + count / 2) / count;
++    int blue = (e.b - b.b - d.b + a.b + count / 2) / count;
++    return (uint16_t)(0x8000 | r | g << 5 | blue << 10);
++}
++
++static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1,
++                 const TileSums* sums = nullptr, int v1 = 0) {
+     if (outside_clip(c, std::min(p0.x, p1.x), std::min(p0.y, p1.y), std::max(p0.x, p1.x), std::max(p0.y, p1.y))) return;
+     int dx = p1.x - p0.x, dy = p1.y - p0.y;
+     int adx = std::abs(dx), ady = std::abs(dy);
+@@ -39,7 +95,10 @@ static void line(const Cmd& c, Pt p0, Pt p1, int v, Rgb g0, Rgb g1) {
+         if (c.textured) {
+             bool end;
+             int u = (int)((int64_t)k * c.w / (len + 1));
+-            if (!texel(c, u, v, pix, end)) {
++            if (sums) {
++                int u1 = std::max(u + 1, (k + 1) * c.w / (len + 1));
++                pix = mean_texel(c, *sums, u, v, u1, v1);
++            } else if (!texel(c, u, v, pix, end)) {
+                 if (end && ++ends == 2) stop = true;
+                 return;
+             }
+@@ -98,13 +157,27 @@ static void quad(const Cmd& c, Pt a, Pt b, Pt cc, Pt d) {
+     int right = std::max(std::abs(cc.x - b.x), std::abs(cc.y - b.y));
+     int n = std::max(left, right);
+     if (n > 2048) return;                       // a shape far off the framebuffer: the chip would spend ages on it
++    const TileSums* sums = nullptr;
++    // The course uses palette VRAM from 0x15000 and textures above the vehicle
++    // banks. Leave cars, fonts, masks, palette priority codes and effects alone.
++    if (g_filter_race_tiles && !g_fb8 && (c.ctrl & 15) == 2 &&
++        c.colr >= 0x15000 / 8 && c.srca >= 0x38000 &&
++        (c.pmod == 0x1888 || c.pmod == 0x1488)) {
++        const int near = std::max(std::abs(b.x - a.x), std::abs(b.y - a.y)) + 1;
++        const int far = std::max(std::abs(cc.x - d.x), std::abs(cc.y - d.y)) + 1;
++        if (2 * std::min(near, far) <= c.w || 2 * (n + 1) <= c.h)
++            sums = opaque_tile(c);
++    }
+     for (int i = 0; i <= n && g_draw_steps < kDrawSteps; ++i) {
+         Pt l{step_to(a.x, d.x, i, n), step_to(a.y, d.y, i, n)};
+         Pt r{step_to(b.x, cc.x, i, n), step_to(b.y, cc.y, i, n)};
+         int v = c.textured ? (int)((int64_t)i * c.h / (n + 1)) : 0;
+         Rgb gl{}, gr{};
+         if (c.gouraud) { gl = mix(c.g[0], c.g[3], i, n); gr = mix(c.g[1], c.g[2], i, n); }
+-        line(c, l, r, v, gl, gr);
++        const int span = std::max(std::abs(l.x - r.x), std::abs(l.y - r.y)) + 1;
++        const TileSums* filtered = sums && (2 * span <= c.w || 2 * (n + 1) <= c.h) ? sums : nullptr;
++        int v1 = filtered ? std::max(v + 1, (i + 1) * c.h / (n + 1)) : 0;
++        line(c, l, r, v, gl, gr, filtered, v1);
+     }
+ }
+ 
 diff --git a/runtime/src/video/vdp2.cpp b/runtime/src/video/vdp2.cpp
-index 4c8bcb1..220485d 100644
+index 4c8bcb1..c9de73a 100644
 --- a/runtime/src/video/vdp2.cpp
 +++ b/runtime/src/video/vdp2.cpp
 @@ -21,7 +21,8 @@
@@ -367,14 +532,82 @@ index 4c8bcb1..220485d 100644
      once(1, reg(0x9A) & 0x3F3F, "line or vertical cell scroll (SCRCTL)", reg(0x9A));
      once(2, reg(0x22) & 0xF, "mosaic (MZCTL)", reg(0x22));
      once(3, (reg(0xD0) | reg(0xD2) | reg(0xD4) | reg(0xD6)) & 0x2020, "the sprite window (WCTL)", reg(0xD0));
-@@ -393,18 +452,28 @@ static uint32_t apply_offset(uint32_t rgb, bool b) {
+@@ -393,18 +452,96 @@ static uint32_t apply_offset(uint32_t rgb, bool b) {
      return (uint32_t)out;
  }
  
-+// The single-player driving display uses RBG0 for scenery and NBG2/3 for instruments.
++// The VDP1 framebuffer is 512 pixels wide in the low-resolution mode the game uses.
 +int rally_wide_margin() {
 +    static const bool enabled = std::getenv("SR_NETLINK_WIDE") != nullptr;
-+    return enabled && (reg(0) & 7) == 1 && (reg(0x20) & 0x1f) == 0x1c ? 59 : 0;
++    if (!enabled) return 0;
++    return (reg(0) & 1) ? 59 : 53;
++}
++
++// Flat title cards and loading illustrations have no off-camera artwork. Extend the
++// boundary colours with a progressively wider filter, preserving all authored pixels.
++static void extend_fixed_page(Frame& f, int margin) {
++    const int right = f.w - margin - 1;
++    for (int side = 0; side < 2; ++side) {
++        const int edge = side ? right : margin, inward = side ? -1 : 1;
++        for (int d = 1; d <= margin; ++d) {
++            int radius = (d + 4) / 5;
++            for (int y = 0; y < f.h; ++y) {
++                int red = 0, green = 0, blue = 0;
++                for (int j = -2; j <= 2; ++j) {
++                    const int yy = std::clamp(y + j * radius / 2, 0, f.h - 1);
++                    const uint32_t* row = &f.px[(size_t)yy * f.w];
++                    for (int i = 0; i < 3; ++i) {
++                        const uint32_t c = row[edge + inward * (i * radius / 3)];
++                        const int w = (3 - std::abs(j)) * (3 - i);
++                        red += (c >> 16 & 255) * w;
++                        green += (c >> 8 & 255) * w;
++                        blue += (c & 255) * w;
++                    }
++                }
++                f.px[(size_t)y * f.w + edge - inward * d] = (red / 54 << 16) | (green / 54 << 8) | blue / 54;
++            }
++        }
++    }
++}
++
++// The loading cards use a landscape drawing with clean edges. Continue its nearby
++// texture, selecting strips whose colours meet the boundary at the same height.
++static void extend_loading_art(Frame& f, int margin) {
++    constexpr int band = 16;
++    const int native_width = f.w - 2 * margin;
++    for (int side = 0; side < 2; ++side) {
++        int edge = side ? margin + native_width - 1 : margin;
++        int inward = side ? -1 : 1;
++        std::vector<int> lengths;
++        for (int y = 0; y < f.h + band; y += band) {
++            int best = 12, best_error = 0x7FFFFFFF;
++            for (int length = 12; length <= 37; ++length) {
++                int error = 0;
++                for (int j = -8; j <= 8; j += 2) {
++                    const uint32_t* row = &f.px[(size_t)std::clamp(y + j, 0, f.h - 1) * f.w];
++                    for (int i = 0; i < 4; ++i) {
++                        uint32_t src = row[edge + inward * i], sample = row[edge + inward * (length + i)];
++                        for (int shift = 0; shift <= 16; shift += 8)
++                            error += std::abs(int(src >> shift & 255) - int(sample >> shift & 255));
++                    }
++                }
++                if (error < best_error) { best_error = error; best = length; }
++            }
++            lengths.push_back(best);
++        }
++        for (int y = 0; y < f.h; ++y) {
++            auto* row = &f.px[(size_t)y * f.w];
++            const int a = lengths[y / band], b = lengths[y / band + 1], blend = y % band;
++            for (int d = 1; d <= margin; ++d) {
++                uint32_t p = row[edge + inward * (a - 1 - (d - 1) % a)];
++                uint32_t q = row[edge + inward * (b - 1 - (d - 1) % b)];
++                uint32_t out = 0;
++                for (int shift = 0; shift <= 16; shift += 8)
++                    out |= (((p >> shift & 255) * (band - blend) + (q >> shift & 255) * blend) / band) << shift;
++                row[edge - inward * d] = out;
++            }
++        }
++    }
 +}
 +
  void vdp2_compose(Frame& f) {
@@ -382,7 +615,7 @@ index 4c8bcb1..220485d 100644
      static const int kWidths[4] = {320, 352, 640, 704};
      int hreso = tvmd & 7;
      f.w = kWidths[hreso < 4 ? hreso : hreso & 1];
-+    int margin = rally_wide_margin();
++    int margin = rally_wide_margin() * ((hreso == 2 || hreso == 3) ? 2 : 1);
 +    f.widescreen = margin > 0;
 +    f.w += margin * 2;
      bool dd = (tvmd >> 6 & 3) == 3;              // double-density interlace
@@ -398,7 +631,7 @@ index 4c8bcb1..220485d 100644
      uint32_t bk = ((uint32_t)(reg(0xAC) & 7) << 16 | reg(0xAE)) * 2;
      bool bk_lines = reg(0xAC) & 0x8000;
      bool add = reg(0xEC) >> 8 & 1;
-@@ -421,7 +490,7 @@ void vdp2_compose(Frame& f) {
+@@ -421,7 +558,7 @@ void vdp2_compose(Frame& f) {
      line_colour.ratio = (uint8_t)(reg(0x10E) & 0x1F);
      uint16_t sfprmd = reg(0xEA), sfccmd = reg(0xEE);
      uint8_t wctl[L_COUNT] = {(uint8_t)(reg(0xD4) >> 8), (uint8_t)reg(0xD0), (uint8_t)(reg(0xD0) >> 8),
@@ -407,7 +640,25 @@ index 4c8bcb1..220485d 100644
      uint8_t cc_wctl = (uint8_t)(reg(0xD6) >> 8);
      uint16_t sdctl = reg(0xE2);
      // gradation: the screen BOKN names, blurred along the line, as the second image wherever it is the
-@@ -468,12 +537,21 @@ void vdp2_compose(Frame& f) {
+@@ -442,7 +579,7 @@ void vdp2_compose(Frame& f) {
+             for (int x = 0; x < f.w; ++x) {
+                 Pix p{};
+                 bool drawn = grad == L_SPRITE ? sprite_pixel(sprite_dot(x, y, dd), p) == S_DOT
+-                                              : nbg[grad - L_NBG0].on && nbg_pixel(nbg[grad - L_NBG0], x, y, p);
++                                              : nbg[grad - L_NBG0].on && nbg_pixel(nbg[grad - L_NBG0], x - margin, y, p);
+                 uint32_t here = drawn ? p.rgb : 0;
+                 if (x == 0) prev[0] = prev[1] = here;
+                 blur[x] = avg(avg(prev[0], prev[1]), here);
+@@ -461,19 +598,37 @@ void vdp2_compose(Frame& f) {
+             // in the order that wins ties: sprite, then NBG0..NBG3
+             l[L_SPRITE] = {};
+             uint8_t shadow = 0;                  // the priority of a shadow dot here
+-            if (!windowed(wctl[L_SPRITE], win, x)) {
++            const int logical_x = x - margin;
++            if (!windowed(wctl[L_SPRITE], win, logical_x)) {
+                 switch (sprite_pixel(sprite_dot(x, y, dd), l[L_SPRITE])) {
+                 case S_DOT: consider(L_SPRITE); break;
+                 case S_SHADOW: shadow = l[L_SPRITE].prio; l[L_SPRITE] = {}; break;
                  case S_NONE: break;
                  }
              }
@@ -416,10 +667,19 @@ index 4c8bcb1..220485d 100644
                  Pix& p = l[L_NBG0 + n];
                  p = {};
                  const Nbg& s = nbg[n];
-                 if (!s.on || !s.prio || windowed(wctl[L_NBG0 + n], win, x)) continue;
+-                if (!s.on || !s.prio || windowed(wctl[L_NBG0 + n], win, x)) continue;
 -                if (!nbg_pixel(s, x, y, p)) continue;
++                if (!s.on || !s.prio || windowed(wctl[L_NBG0 + n], win, logical_x)) continue;
 +                if (n == 4) {
-+                    int rx = hreso == 2 || hreso == 3 ? x >> 1 : x - margin;
++                    // The menu stores its complete repeating background on a single page;
++                    // adjacent VRAM holds other graphics. Wrap only that backdrop.
++                    int sample_x = logical_x;
++                    if (margin && (reg(0x20) & 0x1f) != 0x1c) {
++                        const int page_width = f.w - 2 * margin;
++                        if (sample_x < 0) sample_x += page_width;
++                        else if (sample_x >= page_width) sample_x -= page_width;
++                    }
++                    int rx = hreso == 2 || hreso == 3 ? sample_x >> 1 : sample_x;
 +                    int sx = (int)((rot.origin[0] + rx * rot.horizontal[0] + line * rot.vertical[0]) >> 16);
 +                    int sy = (int)((rot.origin[1] + rx * rot.horizontal[1] + line * rot.vertical[1]) >> 16);
 +                    if (!map_pixel(s, (uint32_t)sx, (uint32_t)sy, p)) continue;
@@ -431,15 +691,96 @@ index 4c8bcb1..220485d 100644
                  p.prio = s.prio;
                  if ((sfprmd >> (n * 2) & 3) == 1) p.prio = (uint8_t)((s.prio & 6) | p.spr);
                  if (!p.prio) continue;
+@@ -490,7 +645,7 @@ void vdp2_compose(Frame& f) {
+                   : second >= 0 ? l[second] : back;
+             if (grad >= 0 && (top == grad || second == grad)) u.rgb = blur[x];
+             uint32_t rgb = t.rgb;
+-            if (top >= 0 && t.cc && !windowed(cc_wctl, win, x)) {
++            if (top >= 0 && t.cc && !windowed(cc_wctl, win, logical_x)) {
+                 uint32_t out = 0;
+                 int ratio = second_ratio ? u.ratio : t.ratio;
+                 for (int sh = 16; sh >= 0; sh -= 8) {
+@@ -509,6 +664,10 @@ void vdp2_compose(Frame& f) {
+             f.px[(size_t)y * f.w + x] = rgb;
+         }
+     }
++    if (margin && !nbg[4].on) {
++        if ((reg(0x20) & 0x1f) == 3) extend_loading_art(f, margin);
++        else extend_fixed_page(f, margin);
++    }
+ }
+ 
+ void vdp2_state(State& s) { s(g_vdp2_vram), s(g_vdp2_cram), s(g_vdp2_regs); }
+diff --git a/runtime/src/video/video.cpp b/runtime/src/video/video.cpp
+index 76c91da..f50e02c 100644
+--- a/runtime/src/video/video.cpp
++++ b/runtime/src/video/video.cpp
+@@ -71,6 +71,36 @@ static void dump(const char* prefix, uint64_t n) {
+     std::fclose(f);
+ }
+ 
++bool rally_frame_interpolation() {
++    static const bool rally = std::getenv("SR_NETLINK_RACE_BOOT") != nullptr;
++    return rally && g_cfg.interp;
++}
++
++// Keep every other field identical to a completed native frame. Between consecutive
++// race frames, interpolate the final colours so the depth order and coverage of
++// the car, road and scenery always come from the game's own renderer.
++static void compose_rally_field() {
++    static Frame previous, current;
++    static uint64_t last_change, previous_field;
++    const uint64_t change = vdp1_frame_changes();
++    const bool consecutive = previous_field + 1 == g_vblanks;
++    previous_field = g_vblanks;
++    vdp2_compose(current);
++    const bool racing = (reg16(g_vdp2_regs, 0x20) & 0x1f) == 0x1c;
++    if (consecutive && racing && current.widescreen && current.w == previous.w &&
++        current.h == previous.h && previous.widescreen && change == last_change + 1) {
++        g_frame = current;
++        for (size_t i = 0; i < current.px.size(); ++i) {
++            uint32_t a = previous.px[i], b = current.px[i];
++            g_frame.px[i] = (a & b) + (((a ^ b) & 0xFEFEFEu) >> 1);
++        }
++    } else {
++        g_frame = current;
++    }
++    std::swap(previous, current);
++    last_change = change;
++}
++
+ static void vblank_in(uint64_t now) {
+     ++g_vblanks;
+     achievements_frame();
+@@ -78,7 +108,7 @@ static void vblank_in(uint64_t now) {
+     if (listed(g_cfg.dump, n)) dump("", g_vblanks);
+     bool shot = listed(g_cfg.shots, n);
+     bool compose = shot || host_wants_frame() || movie_on();
+-    if (vdp1_interp_field(compose) && compose) {
++    if (!rally_frame_interpolation() && vdp1_interp_field(compose) && compose) {
+         uint8_t saved[0x30];
+         std::copy(g_vdp2_regs + 0x70, g_vdp2_regs + 0xA0, saved);
+         vdp1_interp_scroll(g_vdp2_regs + 0x70);
+@@ -88,7 +118,8 @@ static void vblank_in(uint64_t now) {
+         movie_frame(g_frame);
+         host_present(g_frame);
+     } else if (compose) {
+-        vdp2_compose(g_frame);
++        if (rally_frame_interpolation()) compose_rally_field();
++        else vdp2_compose(g_frame);
+         if (shot) write_png(g_cfg.out + "/shot-" + n + ".png", g_frame);
+         movie_frame(g_frame);
+         host_present(g_frame);
 diff --git a/runtime/src/video/video.h b/runtime/src/video/video.h
-index ebaa466..e18bf44 100644
+index ebaa466..131c18b 100644
 --- a/runtime/src/video/video.h
 +++ b/runtime/src/video/video.h
-@@ -26,7 +26,10 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
+@@ -26,7 +26,11 @@ void vdp1_next_draw_keys(std::vector<uint64_t> keys); // --interp: what each com
  
  // ---- VDP2 (vdp2.cpp) --------------------------------------------------------------------
  extern uint8_t g_vdp2_vram[0x80000], g_vdp2_cram[0x1000], g_vdp2_regs[0x200];
 +int rally_wide_margin();
++bool rally_frame_interpolation();
 +
  struct Frame {
 +    bool widescreen = false;

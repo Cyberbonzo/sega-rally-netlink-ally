@@ -24,6 +24,17 @@ def run(*args, **options):
 
 def fetch_runtime(work, origin):
     checkout = work / "upstream"
+    patch = ROOT / "runtime.patch"
+    if checkout.exists():
+        # Keep the prior build and its local edits available when updating.
+        check = subprocess.run(["git", "-C", checkout, "apply", "--reverse", "--check", patch],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if check.returncode:
+            revision = subprocess.check_output(["git", "-C", checkout, "rev-parse", "HEAD"], text=True).strip()
+            if revision != REVISION:
+                raise ValueError("Unexpected runtime revision in the build directory")
+            origin = str(checkout)
+            checkout = work / ("upstream-" + hashlib.sha256(patch.read_bytes()).hexdigest()[:16])
     if not checkout.exists():
         with tempfile.TemporaryDirectory(dir=work) as tmp:
             clean = Path(tmp) / "upstream"

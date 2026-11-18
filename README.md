@@ -1,8 +1,12 @@
-# Sega Rally Plus NetLink para Linux — v0.1.0
+# Sega Rally Plus NetLink para Linux — v0.1.1
 
 Recompilação local da edição americana de **Sega Rally Championship Plus NetLink Edition** para Linux x86-64, a partir do disco fornecido pelo jogador. O jogo inicia no modo offline e usa SDL3 para vídeo, áudio e controles.
 
-Na corrida de um jogador, o campo de visão aumenta nas laterais para preencher a tela em 16:9. Os menus preservam as proporções originais. A interpolação apresenta até 60 quadros por segundo com a lógica do jogo na cadência original, próxima de 30 Hz.
+O velocímetro usa km/h. A corrida amplia o campo de visão nas laterais. O título, os menus, os recordes e os resultados também ocupam a saída 16:9. As ilustrações fixas mantêm suas proporções, com prolongamento do fundo nas laterais. A apresentação intercala imagens completas da corrida para exibição a 60 Hz. A simulação segue a cadência original, próxima de 30 Hz.
+
+O renderizador usa as duas filas de desenho que o jogo reserva para o cenário e os veículos. A versão 0.1.1 corrige a identificação do segundo SH-2, que fazia a primeira fila lotar e deixava trechos de terreno incompletos. As texturas opacas do cenário recebem filtragem quando ficam pequenas à distância.
+
+O Campeonato e a Prática concedem dez segundos adicionais na largada de cada pista, em todas as dificuldades. A partir da segunda etapa do Campeonato, somam-se o saldo anterior, a concessão normal da pista e os dez segundos. Os checkpoints mantêm seus próprios bônus. O jogo continua registrando o tempo real de cada volta.
 
 ## Compilar
 
@@ -45,6 +49,6 @@ As configurações ficam em `game/controls.ini`, o backup do Saturn em `game/sav
 
 ## Compatibilidade e licença
 
-A versão 0.1.0 foi testada no ROG Ally com Bazzite. A cobertura inclui Desert, Forest e Mountain em corridas e o modo Time Attack. Multiplayer, modem NetLink e o circuito bônus ainda precisam de testes.
+A versão 0.1.1 foi testada no ROG Ally com Bazzite. A cobertura inclui Desert, Forest e Mountain em corridas e o modo Time Attack. Multiplayer, modem NetLink e o circuito bônus ainda precisam de testes.
 
 Este projeto usa a revisão `032fd3bc8a6c3e5d23853f53b951aa1446a9dfc1` do saturn-recomp. O repositório distribui scripts de compilação, configuração, endereços de entrada e um patch de código aberto. Você fornece as 17 faixas da sua edição dos EUA. Os arquivos gerados contêm código do jogo e devem permanecer na sua cópia local. As marcas e o jogo pertencem a seus respectivos titulares. A licença MIT abrange o material deste projeto e cada dependência conserva sua própria licença. [Fonte do recompilador](https://github.com/callumjenkins/saturn-recomp/tree/032fd3bc8a6c3e5d23853f53b951aa1446a9dfc1) · [Extração com chdman](https://docs.mamedev.org/tools/chdman.html#extractcd)
