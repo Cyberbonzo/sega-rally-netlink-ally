@@ -1,0 +1,12 @@
+# Only the following source files belong in the public repository.
+*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/runtime.patch
+!/build.py
+!/generate.py
+!/seeds.json
+!/controls.ini
+!/play.sh
+!/.gitattributes
